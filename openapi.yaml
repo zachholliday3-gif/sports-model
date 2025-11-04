@@ -1,20 +1,28 @@
-openapi: 3.0.1
+openapi: 3.1.1
 info:
   title: Zach Sports Model API
   version: "1.0"
 servers:
-  - url: https://your-backend-domain.example.com
+  - url: https://sports-model.up.railway.app   # <-- change if your URL differs
 paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Health check
+      responses:
+        "200": { description: OK }
+
   /api/cbb/schedule:
     get:
       operationId: getCbbSchedule
-      summary: Get CBB schedule for a date
+      summary: Get CBB schedule for a date (YYYYMMDD or YYYY-MM-DD). Defaults to America/New_York today, falls back to yesterday when date is omitted.
       parameters:
         - in: query
           name: date
-          schema: { type: string, example: "20251104", description: "YYYYMMDD. If omitted, today is used." }
+          schema: { type: string, example: "20251104" }
       responses:
         "200": { description: OK }
+
   /api/cbb/projections:
     get:
       operationId: getCbbProjections
@@ -28,15 +36,41 @@ paths:
           schema: { type: string, enum: ["1H","FG"], default: "1H" }
       responses:
         "200": { description: OK }
+
   /api/cbb/matchups/{gameId}:
     get:
       operationId: getCbbMatchup
-      summary: Get a single CBB matchup detail + projection
+      summary: Get one CBB matchup + projection
       parameters:
         - in: path
           name: gameId
           required: true
           schema: { type: string }
+        - in: query
+          name: scope
+          schema: { type: string, enum: ["1H","FG"], default: "1H" }
+      responses:
+        "200": { description: OK }
+
+  /api/cbb/slate:
+    get:
+      operationId: getCbbSlate
+      summary: Get schedule rows with attached model numbers
+      parameters:
+        - in: query
+          name: date
+          schema: { type: string, example: "20251104" }
+        - in: query
+          name: scope
+          schema: { type: string, enum: ["1H","FG"], default: "1H" }
+      responses:
+        "200": { description: OK }
+
+  /api/cbb/mock_slate:
+    get:
+      operationId: getCbbMockSlate
+      summary: Always-returning mock slate for testing the model without ESPN
+      parameters:
         - in: query
           name: scope
           schema: { type: string, enum: ["1H","FG"], default: "1H" }
