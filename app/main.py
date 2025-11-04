@@ -5,9 +5,10 @@ from fastapi.responses import JSONResponse
 from typing import List, Optional
 import logging
 
-from app.models.types import GameLite, Projection, MatchupDetail
-from app.services.espn import get_games_for_date, extract_game_lite, extract_matchup_detail
-from app.services.projections import project_cbb_1h
+from app.models.cbb_types import GameLite, Projection, MatchupDetail
+from app.services.espn_cbb import get_games_for_date, extract_game_lite, extract_matchup_detail
+from app.services.cbb_model import project_cbb_1h
+
 
 # ----------------- Logging Setup -----------------
 logging.basicConfig(level=logging.INFO)
