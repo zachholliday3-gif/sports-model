@@ -1,0 +1,44 @@
+openapi: 3.0.1
+info:
+  title: Zach Sports Model API
+  version: "1.0"
+servers:
+  - url: https://your-backend-domain.example.com
+paths:
+  /api/cbb/schedule:
+    get:
+      operationId: getCbbSchedule
+      summary: Get CBB schedule for a date
+      parameters:
+        - in: query
+          name: date
+          schema: { type: string, example: "20251104", description: "YYYYMMDD. If omitted, today is used." }
+      responses:
+        "200": { description: OK }
+  /api/cbb/projections:
+    get:
+      operationId: getCbbProjections
+      summary: Get CBB projections for a date
+      parameters:
+        - in: query
+          name: date
+          schema: { type: string, example: "20251104" }
+        - in: query
+          name: scope
+          schema: { type: string, enum: ["1H","FG"], default: "1H" }
+      responses:
+        "200": { description: OK }
+  /api/cbb/matchups/{gameId}:
+    get:
+      operationId: getCbbMatchup
+      summary: Get a single CBB matchup detail + projection
+      parameters:
+        - in: path
+          name: gameId
+          required: true
+          schema: { type: string }
+        - in: query
+          name: scope
+          schema: { type: string, enum: ["1H","FG"], default: "1H" }
+      responses:
+        "200": { description: OK }
