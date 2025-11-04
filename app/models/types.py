@@ -1,4 +1,5 @@
-from typing import TypedDict, Literal, Optional
+from typing_extensions import TypedDict, Literal
+from typing import Optional
 
 class GameLite(TypedDict):
     gameId: str
