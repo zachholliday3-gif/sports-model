@@ -2,6 +2,8 @@
 from fastapi import APIRouter, HTTPException, Query
 from typing import List, Optional
 import logging
+from app.services.nfl_weeks import week_window, current_season_week
+from app.services.odds_api import get_nfl_fg_lines  # if not already imported
 
 from app.models.nfl_types import GameLite, Projection, MatchupDetail
 from app.models.nfl_model import project_nfl_fg
@@ -148,3 +150,60 @@ async def nfl_mock_slate():
         m = project_nfl_fg(g["homeTeam"], g["awayTeam"])
         rows.append({**g, "model": {"scope": "FG", **m}, "status": "STATUS_SCHEDULED", "date": None})
     return rows
+@router.get("/this_week")
+async def nfl_this_week():
+    """
+    Returns {season, week, start, end, games:[...]} for the current NFL week.
+    """
+    season, week = current_season_week()
+    start, end = week_window(season, week)
+    try:
+        games = await get_games_for_range(start, end)
+    except Exception:
+        games = []
+    lite = [extract_game_lite(ev) for ev in games]
+    return {"season": season, "week": week, "start": start, "end": end, "games": lite}
+
+
+@router.get("/slate_this_week")
+async def nfl_slate_this_week(include_markets: bool = True):
+    """
+    Returns the slate (model + optional markets/edges) for the current NFL week.
+    """
+    season, week = current_season_week()
+    start, end = week_window(season, week)
+    try:
+        games = await get_games_for_range(start, end)
+    except Exception:
+        games = []
+
+    markets = {}
+    if include_markets:
+        try:
+            markets = await get_nfl_fg_lines()
+        except Exception:
+            markets = {}
+
+    def _norm(s: str) -> str:
+        return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+    rows = []
+    for ev in games:
+        lite = extract_game_lite(ev)
+        m = project_nfl_fg(lite["homeTeam"], lite["awayTeam"])
+
+        token = f"{_norm(lite['awayTeam'])}|{_norm(lite['homeTeam'])}"
+        mk = markets.get(token, {}) if include_markets else {}
+        mt = mk.get("marketTotal")
+        ms = mk.get("marketSpreadHome")
+
+        edge_total = round(m["projTotal"] - mt, 2) if isinstance(mt, (int, float)) else None
+        edge_spread = round(m["projSpreadHome"] - ms, 2) if isinstance(ms, (int, float)) else None
+
+        rows.append({
+            **lite,
+            "model": {"scope": "FG", **m},
+            "market": {"total": mt, "spreadHome": ms, "book": mk.get("book")},
+            "edge": {"total": edge_total, "spreadHome": edge_spread},
+        })
+    return {"season": season, "week": week, "start": start, "end": end, "rows": rows}
