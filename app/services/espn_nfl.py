@@ -1,153 +1,129 @@
 # app/services/espn_nfl.py
-import httpx, asyncio
-from typing import Any, Dict, List, Tuple, Optional
+from __future__ import annotations
+
+import asyncio
 from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
+import httpx
 from zoneinfo import ZoneInfo
 
-CORE_URL = "https://sports.core.api.espn.com/v2/sports/football/nfl/scoreboard"
-SITE_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-
+NY = ZoneInfo("America/New_York")
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
-# ---------- helpers ----------
-def _ny_date_str(dt: Optional[datetime] = None) -> str:
-    now_ny = (dt or datetime.now(ZoneInfo("America/New_York")))
-    return now_ny.strftime("%Y%m%d")
+SITE_API = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
 
-def _normalize_date_str(yyyymmdd: Optional[str]) -> str:
-    if yyyymmdd is None:
-        return _ny_date_str()
-    y = yyyymmdd.strip().lower()
-    if y in ("", "today"):
-        return _ny_date_str()
-    q = yyyymmdd.replace("-", "")
-    if len(q) != 8 or not q.isdigit():
-        raise ValueError("date must be YYYYMMDD or YYYY-MM-DD")
-    return q
+def _norm(s: str) -> str:
+    return "".join(ch for ch in (s or "").lower() if ch.isalnum())
 
-def _dash(q: str) -> str:
-    return f"{q[:4]}-{q[4:6]}-{q[6:]}"
+def _today_yyyymmdd() -> str:
+    now = datetime.now(NY)
+    return now.strftime("%Y%m%d")
 
-async def _get(url: str, params: Dict[str, str] | None = None) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=20.0, headers=HEADERS) as client:
+def _coerce_yyyymmdd(date_str: Optional[str]) -> str:
+    """
+    Accepts:
+      - None -> today (US/Eastern)
+      - 'YYYYMMDD' -> returns as-is if valid
+      - 'YYYY-MM-DD' -> converts to 'YYYYMMDD'
+    Raises ValueError on other inputs.
+    """
+    if not date_str:
+        return _today_yyyymmdd()
+    ds = date_str.strip()
+    if len(ds) == 10 and ds[4] == "-" and ds[7] == "-":
+        # YYYY-MM-DD -> YYYYMMDD
+        try:
+            dt = datetime.strptime(ds, "%Y-%m-%d")
+            return dt.strftime("%Y%m%d")
+        except Exception:
+            pass
+    if len(ds) == 8 and ds.isdigit():
+        # YYYYMMDD
+        return ds
+    raise ValueError("date must be YYYYMMDD (or YYYY-MM-DD)")
+
+async def _get_json(url: str, params: Dict[str, Any]) -> Any:
+    async with httpx.AsyncClient(timeout=12.0, headers=HEADERS) as client:
         last = None
-        for i in range(3):
+        for i in range(2):
             try:
                 r = await client.get(url, params=params)
                 r.raise_for_status()
                 return r.json()
-            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            except Exception as e:
                 last = e
-                await asyncio.sleep(0.6 * (i + 1))
-        return {"_error": str(last or "unknown"), "_url": url, "_params": params or {}}
+                await asyncio.sleep(0.4 * (i + 1))
+        raise last or RuntimeError("unknown http error")
 
-async def _events_from_core(sb: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], bool]:
-    evs = sb.get("events")
-    if not isinstance(evs, list) or not evs: return ([], False)
+async def get_games_for_date(date: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Loads NFL games for a given date using ESPN site.api scoreboard.
+    ESPN wants: dates=YYYYMMDD-YYYYMMDD (inclusive range), not ISO with dashes.
+    """
+    d = _coerce_yyyymmdd(date)
+    params = {
+        "dates": f"{d}-{d}",
+        "limit": 500,
+    }
+    data = await _get_json(SITE_API, params)
+    events = data.get("events") or []
+    # Ensure list type
+    if not isinstance(events, list):
+        return []
+    return events
+
+async def get_games_for_range(start: datetime, end: datetime) -> List[Dict[str, Any]]:
+    """
+    Inclusive day range in US/Eastern. Calls get_games_for_date() per day.
+    """
+    # floor to date in NY
+    start_d = start.astimezone(NY).date()
+    end_d = end.astimezone(NY).date()
+    if end_d < start_d:
+        start_d, end_d = end_d, start_d
+
+    days = []
+    cur = start_d
+    while cur <= end_d:
+        days.append(cur.strftime("%Y%m%d"))
+        cur += timedelta(days=1)
+
     out: List[Dict[str, Any]] = []
-    for ref in evs:
+    for ds in days:
         try:
-            ev_url = ref.get("$ref") if isinstance(ref, dict) else None
-            if not ev_url: continue
-            ev = await _get(ev_url)
-            if isinstance(ev, dict) and ev.get("competitions"):
-                out.append(ev)
+            evs = await get_games_for_date(ds)
+            out.extend(evs)
         except Exception:
+            # skip day on failure
             continue
-    return (out, True)
+    return out
 
-def _events_from_site(sb: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], bool]:
-    evs = sb.get("events")
-    if isinstance(evs, list) and evs: return (evs, True)
-    return ([], False)
-
-# ---------- public fetchers ----------
-async def get_games_for_date(yyyymmdd: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Robust single-day fetcher that tries multiple 'dates' formats and both endpoints:
-      - site.api with range (YYYYMMDD-YYYYMMDD)  <-- most reliable for NFL
-      - site.api with dashed range (YYYY-MM-DD to same)
-      - core.v2 with single, dashed, and range forms
-    """
-    q = _normalize_date_str(yyyymmdd)
-    candidates: List[Dict[str, Any]] = []
-
-    # Site API tends to like ranges even for one day
-    candidates.append(("site", {"dates": f"{q}-{q}", "limit": "500"}))
-    candidates.append(("site", {"dates": f"{_dash(q)}-{_dash(q)}", "limit": "500"}))
-
-    # Core API sometimes accepts these
-    candidates.append(("core", {"dates": q}))
-    candidates.append(("core", {"dates": _dash(q)}))
-    candidates.append(("core", {"dates": f"{q}-{q}"}))
-    candidates.append(("core", {"dates": f"{_dash(q)}-{_dash(q)}"}))
-
-    # try in order
-    for endpoint, params in candidates:
-        if endpoint == "site":
-            sb = await _get(SITE_URL, params)
-            evs, ok = _events_from_site(sb)
-        else:
-            sb = await _get(CORE_URL, params)
-            evs, ok = _events_from_core(sb)
-        if ok and evs:
-            return evs
-
-    # fallback if no explicit date was passed: try yesterday (common for late games)
-    if yyyymmdd is None:
-        y = datetime.now(ZoneInfo("America/New_York")) - timedelta(days=1)
-        return await get_games_for_date(y.strftime("%Y%m%d"))
-
-    return []
-
-async def get_games_for_range(start_yyyymmdd: str, end_yyyymmdd: str) -> List[Dict[str, Any]]:
-    """Gather games across [start, end] inclusive by calling per-day."""
-    start = datetime.strptime(_normalize_date_str(start_yyyymmdd), "%Y%m%d")
-    end = datetime.strptime(_normalize_date_str(end_yyyymmdd), "%Y%m%d")
-    days = (end - start).days
-    out: List[Dict[str, Any]] = []
-    for i in range(days + 1):
-        q = (start + timedelta(days=i)).strftime("%Y%m%d")
-        out.extend(await get_games_for_date(q))
-    # de-dup by id
-    seen = set()
-    uniq = []
-    for ev in out:
-        ev_id = ev.get("id") or ev.get("guid")
-        if ev_id in seen: continue
-        seen.add(ev_id)
-        uniq.append(ev)
-    return uniq
-
-# ---------- extractors ----------
-def _name(team_obj: Dict[str, Any]) -> str:
-    team = team_obj.get("team") or {}
-    return team.get("displayName") or team.get("name") or team.get("shortDisplayName") or "Unknown"
+def _team_name(comp: Dict[str, Any]) -> str:
+    team = (comp or {}).get("team") or {}
+    # Prefer "displayName"; fall back to "location" or "name"
+    return team.get("displayName") or team.get("location") or team.get("name") or "Unknown"
 
 def extract_game_lite(ev: Dict[str, Any]) -> Dict[str, Any]:
-    comp = ev["competitions"][0]
-    teams = comp["competitors"]
-    home = next(t for t in teams if t.get("homeAway") == "home")
-    away = next(t for t in teams if t.get("homeAway") == "away")
-    return {
-        "gameId": str(ev.get("id") or comp.get("id") or ""),
-        "date": ev.get("date") or comp.get("date"),
-        "status": comp.get("status", {}).get("type", {}).get("name", "STATUS_SCHEDULED"),
-        "homeTeam": _name(home),
-        "awayTeam": _name(away),
-    }
+    """
+    Normalize an ESPN event -> lite row used by routers.
+    """
+    game_id = ev.get("id") or ""
+    date = ev.get("date")  # ISO timestamp
+    comps = (ev.get("competitions") or [{}])
+    comp = comps[0] if comps else {}
+    competitors = comp.get("competitors") or []
 
-def extract_matchup_detail(ev: Dict[str, Any]) -> Dict[str, Any]:
-    comp = ev["competitions"][0]
-    teams = comp["competitors"]
-    home = next(t for t in teams if t.get("homeAway") == "home")
-    away = next(t for t in teams if t.get("homeAway") == "away")
-    venue = (comp.get("venue") or {}).get("fullName")
+    home_name, away_name = "Home", "Away"
+    for c in competitors:
+        if (c.get("homeAway") or "").lower() == "home":
+            home_name = _team_name(c)
+        elif (c.get("homeAway") or "").lower() == "away":
+            away_name = _team_name(c)
+
     return {
-        "gameId": str(ev.get("id") or comp.get("id") or ""),
-        "date": ev.get("date") or comp.get("date"),
-        "status": comp.get("status", {}).get("type", {}).get("name", "STATUS_SCHEDULED"),
-        "homeTeam": _name(home),
-        "awayTeam": _name(away),
-        "venue": venue,
+        "gameId": str(game_id),
+        "startTime": date,
+        "homeTeam": home_name,
+        "awayTeam": away_name,
     }
