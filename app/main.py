@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 import logging
 
 from app.routers import cbb_routes
+from app.routers import nfl_routes
 
 # -------- logging --------
 logging.basicConfig(level=logging.INFO)
@@ -41,3 +42,5 @@ async def health():
 
 # -------- register CBB routes --------
 app.include_router(cbb_routes.router, prefix="/api/cbb")
+
+app.include_router(nfl_routes.router, prefix="/api/nfl")
