@@ -2,20 +2,19 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 import logging
+import time
 import os
 
-from app.routers import cbb_routes
-from app.routers import nfl_routes
+# Routers
+from app.routers import cbb_routes, nfl_routes
 
-from app.core.db import init_engine, close_engine
-from app.core.persist import ensure_schema
-
-# -------- logging --------
+# ------------ Logging ------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
-# -------- app --------
+# ------------ App ------------
 app = FastAPI(
     title="Zach Sports Model API",
     version="1.0.0",
@@ -24,13 +23,27 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
-# -------- global error handler --------
-@app.exception_handler(Exception)
-async def _unhandled(request, exc):
-    logger.exception("UNHANDLED ERROR: %s %s", request.method, request.url, exc_info=exc)
-    return JSONResponse(status_code=500, content={"error": "internal_error"})
+# Access log (method, path, query, status, timing)
+class AccessLogMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        t0 = time.perf_counter()
+        try:
+            response = await call_next(request)
+            status = response.status_code
+        except Exception:
+            status = 500
+            raise
+        finally:
+            dt = (time.perf_counter() - t0) * 1000
+            logger.info(
+                "ACCESS %s %s q=%s -> %s in %.1fms",
+                request.method, request.url.path, request.url.query, status, dt
+            )
+        return response
 
-# -------- CORS --------
+app.add_middleware(AccessLogMiddleware)
+
+# CORS (open; lock down later if you want)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,20 +52,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------- health --------
+# Global error handler
+@app.exception_handler(Exception)
+async def _unhandled(request, exc):
+    logger.exception("UNHANDLED ERROR: %s %s", request.method, request.url)
+    return JSONResponse(status_code=500, content={"error": "internal_error"})
+
+# Health & status
 @app.get("/health")
 async def health():
     return {"ok": True}
-
-@app.on_event("startup")
-async def _startup():
-    eng = await init_engine()
-    if eng:
-        await ensure_schema()
-
-@app.on_event("shutdown")
-async def _shutdown():
-    await close_engine()
 
 @app.get("/status")
 async def status():
@@ -60,11 +69,9 @@ async def status():
         "ok": True,
         "has_odds_key": bool(os.getenv("ODDS_API_KEY")),
         "regions": os.getenv("ODDS_REGIONS", "us"),
-        "books": os.getenv("ODDS_BOOKMAKERS", None),
+        "books": os.getenv("ODDS_BOOKMAKERS") or None,
     }
 
-# -------- register CBB routes --------
+# Mount routers
 app.include_router(cbb_routes.router, prefix="/api/cbb")
-
-# -------- register NFL routes --------
 app.include_router(nfl_routes.router, prefix="/api/nfl")

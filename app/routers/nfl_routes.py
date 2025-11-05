@@ -1,60 +1,58 @@
 # app/routers/nfl_routes.py
 from fastapi import APIRouter, HTTPException, Query
-from typing import List, Optional
-import logging
+from typing import Optional, List
 import asyncio
-from app.services.nfl_weeks import week_window, current_season_week
-from app.services.odds_api import get_nfl_fg_lines  # if not already imported
+import logging
 
-from app.models.nfl_types import GameLite, Projection, MatchupDetail
-from app.models.nfl_model import project_nfl_fg
 from app.services.espn_nfl import (
     get_games_for_date,
     get_games_for_range,
     extract_game_lite,
-    extract_matchup_detail,
 )
-from app.services.nfl_weeks import week_window
-from app.services.props_nfl import fetch_defense_allowed_last5, project_player_line
+from app.services.nfl_weeks import week_window, current_season_week
+from app.models.nfl_model import project_nfl_fg
+from app.services.odds_api import get_nfl_fg_lines  # shared odds service
 
-# NEW: persistence helpers
-from app.core.persist import upsert_games, insert_projections
+logger = logging.getLogger("app.nfl")
+router = APIRouter(tags=["nfl"])
 
-logger = logging.getLogger("app")
-router = APIRouter()
+def _norm(s: str) -> str:
+    return "".join(ch for ch in (s or "").lower() if ch.isalnum())
 
-
-@router.get("/schedule", response_model=List[GameLite])
+# -------- Schedule --------
+@router.get("/schedule")
 async def nfl_schedule(
     date: Optional[str] = None,
     season: Optional[int] = None,
     week: Optional[int] = None,
 ):
+    """
+    Get schedule by date (YYYYMMDD) or by season+week.
+    """
     try:
         if season and week:
-            start, end = week_window(season, week)   # no 'await'
+            start, end = week_window(season, week)
             games = await get_games_for_range(start, end)
         else:
             games = await get_games_for_date(date)
-        logger.info("nfl schedule: %d games (date=%s season=%s week=%s)", len(games), date, season, week)
-        return [extract_game_lite(ev) for ev in games]
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.exception("nfl schedule failed (date=%s season=%s week=%s): %s", date, season, week, e)
+        logger.exception("nfl schedule failed: date=%s season=%s week=%s err=%s", date, season, week, e)
         return []
+    rows = [extract_game_lite(ev) for ev in games]
+    logger.info("NFL schedule: date=%s season=%s week=%s -> %d", date, season, week, len(rows))
+    return rows
 
-
+# -------- Slate (FG projections) --------
 @router.get("/slate")
 async def nfl_slate(
     date: Optional[str] = None,
     season: Optional[int] = None,
     week: Optional[int] = None,
     scope: str = Query("FG", pattern="^FG$"),
+    include_markets: bool = False,  # default safe/fast
 ):
     if scope != "FG":
         raise HTTPException(400, "NFL supports FG scope only")
-
     try:
         if season and week:
             start, end = week_window(season, week)
@@ -62,100 +60,61 @@ async def nfl_slate(
         else:
             games = await get_games_for_date(date)
     except Exception as e:
-        logger.exception("nfl slate failed (date=%s season=%s week=%s): %s", date, season, week, e)
+        logger.exception("nfl slate failed: date=%s season=%s week=%s err=%s", date, season, week, e)
         return []
+
+    logger.info("NFL slate params: date=%s season=%s week=%s include_markets=%s", date, season, week, include_markets)
+    logger.info("NFL games fetched: %d", len(games))
+
+    markets = {}
+    if include_markets:
+        try:
+            markets = await asyncio.wait_for(get_nfl_fg_lines(), timeout=8.0)
+            logger.info("NFL markets loaded: %d", len(markets))
+        except Exception as e:
+            logger.exception("nfl odds fetch failed or timed out: %s", e)
+            markets = {}
 
     rows = []
     for ev in games:
         lite = extract_game_lite(ev)
         m = project_nfl_fg(lite["homeTeam"], lite["awayTeam"])
-        rows.append({**lite, "model": {"scope": scope, **m}})
-
-    # --- PERSIST (graceful if no DATABASE_URL) ---
-    try:
-        await upsert_games(rows, "NFL")
-        await insert_projections(rows, "NFL", scope)
-    except Exception as e:
-        logger.exception("persist NFL slate failed: %s", e)
-
-    logger.info("nfl slate: %d rows (date=%s season=%s week=%s)", len(rows), date, season, week)
+        token = f"{_norm(lite['awayTeam'])}|{_norm(lite['homeTeam'])}"
+        mk = markets.get(token, {}) if include_markets else {}
+        mt = mk.get("marketTotal")
+        ms = mk.get("marketSpreadHome")
+        edge_total = round(m["projTotal"] - mt, 2) if isinstance(mt, (int, float)) else None
+        edge_spread = round(m["projSpreadHome"] - ms, 2) if isinstance(ms, (int, float)) else None
+        rows.append({
+            **lite,
+            "model": {"scope": "FG", **m},
+            "market": {"total": mt, "spreadHome": ms, "book": mk.get("book")},
+            "edge": {"total": edge_total, "spreadHome": edge_spread},
+        })
     return rows
 
-
-@router.get("/matchups/{gameId}", response_model=MatchupDetail)
-async def nfl_matchup(
-    gameId: str,
+# -------- Edges (ranked) --------
+@router.get("/edges")
+async def nfl_edges(
     date: Optional[str] = None,
     season: Optional[int] = None,
     week: Optional[int] = None,
+    sort: str = Query("spread", pattern="^(spread|total)$"),
+    limit: int = 25,
 ):
-    try:
-        if season and week:
-            start, end = week_window(season, week)
-            games = await get_games_for_range(start, end)
-        else:
-            games = await get_games_for_date(date)
-    except Exception as e:
-        logger.exception("nfl matchup load failed (gameId=%s): %s", gameId, e)
-        raise HTTPException(404, "Could not load matchups")
+    rows = await nfl_slate(date=date, season=season, week=week, include_markets=True)
+    key = "spreadHome" if sort == "spread" else "total"
 
-    ev = next((g for g in games if str(g.get("id") or "") == str(gameId)), None)
-    if not ev:
-        raise HTTPException(404, "Game not found")
+    def _abs_edge(row):
+        val = (row.get("edge") or {}).get(key)
+        return abs(val) if isinstance(val, (int, float)) else -1.0
 
-    base = extract_matchup_detail(ev)
-    m = project_nfl_fg(base["homeTeam"], base["awayTeam"])
-    return {**base, "notes": None, "model": {"gameId": base["gameId"], "scope": "FG", **m}}
+    ranked = sorted(rows, key=_abs_edge, reverse=True)
+    return ranked[:max(1, min(limit, 100))]
 
-
-@router.get("/player_props")
-async def nfl_player_props(
-    player: str,
-    position: str,
-    team: str,
-    opponent: str,
-    season: Optional[int] = None,
-    week: Optional[int] = None,
-):
-    pos = position.upper()
-    if pos not in ("QB", "RB", "WR", "TE"):
-        raise HTTPException(400, "position must be one of: QB, RB, WR, TE")
-
-    try:
-        opp_def = await fetch_defense_allowed_last5(opponent)
-    except Exception as e:
-        logger.exception("nfl player_props fetch failed (opponent=%s): %s", opponent, e)
-        raise HTTPException(502, "Could not fetch opponent defense metrics")
-
-    lines = project_player_line(player, pos, opp_def)
-    return {
-        "player": player,
-        "position": pos,
-        "team": team,
-        "opponent": opponent,
-        "season": season,
-        "week": week,
-        "basis": "opponent defense allowed (last 5) — stub provider",
-        "props": lines,
-    }
-
-
-@router.get("/mock_slate")
-async def nfl_mock_slate():
-    sample = [
-        {"gameId": "N1", "homeTeam": "Kansas City Chiefs", "awayTeam": "Baltimore Ravens"},
-        {"gameId": "N2", "homeTeam": "Philadelphia Eagles", "awayTeam": "Dallas Cowboys"},
-    ]
-    rows = []
-    for g in sample:
-        m = project_nfl_fg(g["homeTeam"], g["awayTeam"])
-        rows.append({**g, "model": {"scope": "FG", **m}, "status": "STATUS_SCHEDULED", "date": None})
-    return rows
+# -------- “This Week” helpers --------
 @router.get("/this_week")
 async def nfl_this_week():
-    """
-    Returns {season, week, start, end, games:[...]} for the current NFL week.
-    """
     season, week = current_season_week()
     start, end = week_window(season, week)
     try:
@@ -163,14 +122,11 @@ async def nfl_this_week():
     except Exception:
         games = []
     lite = [extract_game_lite(ev) for ev in games]
+    logger.info("NFL this_week: season=%s week=%s games=%d", season, week, len(lite))
     return {"season": season, "week": week, "start": start, "end": end, "games": lite}
 
-
 @router.get("/slate_this_week")
-async def nfl_slate_this_week(include_markets: bool = True):
-    """
-    Returns the slate (model + optional markets/edges) for the current NFL week.
-    """
+async def nfl_slate_this_week(include_markets: bool = False):
     season, week = current_season_week()
     start, end = week_window(season, week)
     try:
@@ -178,30 +134,28 @@ async def nfl_slate_this_week(include_markets: bool = True):
     except Exception:
         games = []
 
+    logger.info("NFL slate_this_week: season=%s week=%s include_markets=%s", season, week, include_markets)
+    logger.info("NFL games fetched: %d", len(games))
+
     markets = {}
     if include_markets:
         try:
-            markets = await get_nfl_fg_lines(get_nfl_fg_lines(), timeout=8.0)
+            markets = await asyncio.wait_for(get_nfl_fg_lines(), timeout=8.0)
+            logger.info("NFL markets loaded: %d", len(markets))
         except Exception as e:
             logger.exception("nfl odds fetch failed or timed out: %s", e)
             markets = {}
-
-    def _norm(s: str) -> str:
-        return "".join(ch for ch in (s or "").lower() if ch.isalnum())
 
     rows = []
     for ev in games:
         lite = extract_game_lite(ev)
         m = project_nfl_fg(lite["homeTeam"], lite["awayTeam"])
-
         token = f"{_norm(lite['awayTeam'])}|{_norm(lite['homeTeam'])}"
         mk = markets.get(token, {}) if include_markets else {}
         mt = mk.get("marketTotal")
         ms = mk.get("marketSpreadHome")
-
         edge_total = round(m["projTotal"] - mt, 2) if isinstance(mt, (int, float)) else None
         edge_spread = round(m["projSpreadHome"] - ms, 2) if isinstance(ms, (int, float)) else None
-
         rows.append({
             **lite,
             "model": {"scope": "FG", **m},
@@ -209,3 +163,19 @@ async def nfl_slate_this_week(include_markets: bool = True):
             "edge": {"total": edge_total, "spreadHome": edge_spread},
         })
     return {"season": season, "week": week, "start": start, "end": end, "rows": rows}
+
+# -------- Projections alias --------
+@router.get("/projections")
+async def nfl_projections(
+    date: Optional[str] = None,
+    season: Optional[int] = None,
+    week: Optional[int] = None,
+    include_markets: bool = False,
+):
+    return await nfl_slate(
+        date=date,
+        season=season,
+        week=week,
+        scope="FG",
+        include_markets=include_markets,
+    )
