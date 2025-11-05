@@ -2,6 +2,7 @@
 from fastapi import APIRouter, HTTPException, Query
 from typing import List, Optional
 import logging
+import asyncio
 from app.services.nfl_weeks import week_window, current_season_week
 from app.services.odds_api import get_nfl_fg_lines  # if not already imported
 
@@ -180,8 +181,9 @@ async def nfl_slate_this_week(include_markets: bool = True):
     markets = {}
     if include_markets:
         try:
-            markets = await get_nfl_fg_lines()
-        except Exception:
+            markets = await get_nfl_fg_lines(get_nfl_fg_lines(), timeout=8.0)
+        except Exception as e:
+            logger.exception("nfl odds fetch failed or timed out: %s", e)
             markets = {}
 
     def _norm(s: str) -> str:

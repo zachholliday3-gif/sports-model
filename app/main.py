@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import logging
+import os
 
 from app.routers import cbb_routes
 from app.routers import nfl_routes
@@ -52,6 +53,15 @@ async def _startup():
 @app.on_event("shutdown")
 async def _shutdown():
     await close_engine()
+
+@app.get("/status")
+async def status():
+    return {
+        "ok": True,
+        "has_odds_key": bool(os.getenv("ODDS_API_KEY")),
+        "regions": os.getenv("ODDS_REGIONS", "us"),
+        "books": os.getenv("ODDS_BOOKMAKERS", None),
+    }
 
 # -------- register CBB routes --------
 app.include_router(cbb_routes.router, prefix="/api/cbb")

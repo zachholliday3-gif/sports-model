@@ -13,17 +13,18 @@ def _norm(s: str) -> str:
     return "".join(ch for ch in (s or "").lower() if ch.isalnum())
 
 async def _get_json(url: str, params: Dict[str, str]) -> Any:
-    async with httpx.AsyncClient(timeout=20.0, headers=HEADERS) as client:
+    async with httpx.AsyncClient(timeout=8.0, headers=HEADERS) as client:  # 8s total
         last = None
-        for i in range(3):
+        for i in range(2):  # 2 tries max
             try:
                 r = await client.get(url, params=params)
                 r.raise_for_status()
                 return r.json()
             except Exception as e:
                 last = e
-                await asyncio.sleep(0.6 * (i + 1))
+                await asyncio.sleep(0.5 * (i + 1))
         return {"_error": str(last or "unknown"), "_url": url, "_params": params}
+
 
 async def _list_events(api_key: str) -> List[Dict[str, Any]]:
     """List upcoming/live NCAAB events (no odds)."""
