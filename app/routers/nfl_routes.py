@@ -14,10 +14,13 @@ from app.services.espn_nfl import (
 from app.services.nfl_weeks import week_window
 from app.services.props_nfl import fetch_defense_allowed_last5, project_player_line
 
+# NEW: persistence helpers
+from app.core.persist import upsert_games, insert_projections
+
 logger = logging.getLogger("app")
 router = APIRouter()
 
-# ---------- Schedule (by date OR by week) ----------
+
 @router.get("/schedule", response_model=List[GameLite])
 async def nfl_schedule(
     date: Optional[str] = None,
@@ -26,7 +29,7 @@ async def nfl_schedule(
 ):
     try:
         if season and week:
-            start, end = week_window(season, week)   # NOTE: no 'await'
+            start, end = week_window(season, week)   # no 'await'
             games = await get_games_for_range(start, end)
         else:
             games = await get_games_for_date(date)
@@ -36,10 +39,9 @@ async def nfl_schedule(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception("nfl schedule failed (date=%s season=%s week=%s): %s", date, season, week, e)
-        return []  # graceful fallback instead of 500
+        return []
 
 
-# ---------- Slate (full game projections) ----------
 @router.get("/slate")
 async def nfl_slate(
     date: Optional[str] = None,
@@ -65,11 +67,18 @@ async def nfl_slate(
         lite = extract_game_lite(ev)
         m = project_nfl_fg(lite["homeTeam"], lite["awayTeam"])
         rows.append({**lite, "model": {"scope": scope, **m}})
+
+    # --- PERSIST (graceful if no DATABASE_URL) ---
+    try:
+        await upsert_games(rows, "NFL")
+        await insert_projections(rows, "NFL", scope)
+    except Exception as e:
+        logger.exception("persist NFL slate failed: %s", e)
+
     logger.info("nfl slate: %d rows (date=%s season=%s week=%s)", len(rows), date, season, week)
     return rows
 
 
-# ---------- Single matchup ----------
 @router.get("/matchups/{gameId}", response_model=MatchupDetail)
 async def nfl_matchup(
     gameId: str,
@@ -96,7 +105,6 @@ async def nfl_matchup(
     return {**base, "notes": None, "model": {"gameId": base["gameId"], "scope": "FG", **m}}
 
 
-# ---------- Player props (stub, opponent-adjusted) ----------
 @router.get("/player_props")
 async def nfl_player_props(
     player: str,
@@ -129,7 +137,6 @@ async def nfl_player_props(
     }
 
 
-# ---------- Mock slate (always works; for sanity checks) ----------
 @router.get("/mock_slate")
 async def nfl_mock_slate():
     sample = [

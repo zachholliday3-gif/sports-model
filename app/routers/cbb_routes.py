@@ -12,16 +12,17 @@ from app.services.espn_cbb import (
 )
 from app.services.odds_api import get_cbb_1h_lines
 
+# NEW: persistence helpers
+from app.core.persist import upsert_games, insert_projections, insert_markets_edges
+
 logger = logging.getLogger("app")
 router = APIRouter()
 
 
-# ----------------- Helpers -----------------
 def _norm(s: str) -> str:
     return "".join(ch for ch in (s or "").lower() if ch.isalnum())
 
 
-# ----------------- Schedule -----------------
 @router.get("/schedule", response_model=List[GameLite])
 async def cbb_schedule(date: Optional[str] = None):
     try:
@@ -35,7 +36,6 @@ async def cbb_schedule(date: Optional[str] = None):
     return [extract_game_lite(ev) for ev in games]
 
 
-# ----------------- Projections -----------------
 @router.get("/projections", response_model=List[Projection])
 async def cbb_projections(date: Optional[str] = None, scope: str = "1H"):
     if scope not in ("1H", "FG"):
@@ -65,7 +65,6 @@ async def cbb_projections(date: Optional[str] = None, scope: str = "1H"):
     return out
 
 
-# ----------------- Single Matchup -----------------
 @router.get("/matchups/{gameId}", response_model=MatchupDetail)
 async def cbb_matchup(gameId: str, scope: str = "1H"):
     try:
@@ -90,7 +89,6 @@ async def cbb_matchup(gameId: str, scope: str = "1H"):
     return {**base, "notes": None, "model": {"gameId": base["gameId"], "scope": scope, **m}}
 
 
-# ----------------- Slate (Schedule + Model + optional Markets/Edges) -----------------
 @router.get("/slate")
 async def cbb_slate(
     date: Optional[str] = None,
@@ -99,7 +97,7 @@ async def cbb_slate(
 ):
     """
     Returns schedule rows with model numbers; optionally includes market lines and edges.
-    If markets are unavailable (no ODDS_API_KEY or provider empty), market/edge fields are null.
+    Also persists games, projections, and (if included) markets/edges.
     """
     try:
         games = await get_games_for_date(date)
@@ -108,11 +106,10 @@ async def cbb_slate(
         return []
     logger.info("slate: %d games for date=%s", len(games), date)
 
-    # Fetch markets (graceful if key missing or provider down)
     markets = {}
     if include_markets:
         try:
-            markets = await get_cbb_1h_lines(None)
+            markets = await get_cbb_1h_lines(None)  # true 1H via The Odds API (if key present)
         except Exception as e:
             logger.exception("odds fetch failed: %s", e)
             markets = {}
@@ -132,7 +129,7 @@ async def cbb_slate(
                 "confidence": base["confidence"],
             }
 
-        # Market matching by normalized "away|home"
+        # Markets & edges
         token = f"{_norm(lite['awayTeam'])}|{_norm(lite['homeTeam'])}"
         mk = markets.get(token, {}) if include_markets else {}
         market_total = mk.get("marketTotal")
@@ -158,10 +155,19 @@ async def cbb_slate(
                 "spreadHome": edge_spread,
             },
         })
+
+    # --- PERSIST (graceful if no DATABASE_URL) ---
+    try:
+        await upsert_games(rows, "CBB")
+        await insert_projections(rows, "CBB", scope)
+        if include_markets:
+            await insert_markets_edges(rows, "CBB", scope)
+    except Exception as e:
+        logger.exception("persist CBB slate failed: %s", e)
+
     return rows
 
 
-# ----------------- Edges (ranked) -----------------
 @router.get("/edges")
 async def cbb_edges(
     date: Optional[str] = None,
@@ -169,10 +175,6 @@ async def cbb_edges(
     sort: str = Query("spread", pattern="^(spread|total)$"),
     limit: int = 25,
 ):
-    """
-    Returns slate with model + market + edge, sorted by absolute edge.
-    If markets are unavailable, edge fields are null and such rows sort to the bottom.
-    """
     rows = await cbb_slate(date=date, scope=scope, include_markets=True)
     key = "spreadHome" if sort == "spread" else "total"
 
@@ -184,7 +186,6 @@ async def cbb_edges(
     return ranked[:max(1, min(limit, 100))]
 
 
-# ----------------- Mock Slate (No ESPN Required) -----------------
 @router.get("/mock_slate")
 async def cbb_mock_slate(scope: str = "1H"):
     sample_games = [
@@ -202,5 +203,5 @@ async def cbb_mock_slate(scope: str = "1H"):
                 "projSpreadHome": round(base["projSpreadHome"] * 2.0, 1),
                 "confidence": base["confidence"],
             }
-        out.append({**g, "model": {"scope": scope, **m}})
+        out.append({**g, "model": {"scope": scope, **m}, "status": "STATUS_SCHEDULED", "date": None})
     return out

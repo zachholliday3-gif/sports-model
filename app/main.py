@@ -7,6 +7,9 @@ import logging
 from app.routers import cbb_routes
 from app.routers import nfl_routes
 
+from app.core.db import init_engine, close_engine
+from app.core.persist import ensure_schema
+
 # -------- logging --------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
@@ -40,7 +43,18 @@ app.add_middleware(
 async def health():
     return {"ok": True}
 
+@app.on_event("startup")
+async def _startup():
+    eng = await init_engine()
+    if eng:
+        await ensure_schema()
+
+@app.on_event("shutdown")
+async def _shutdown():
+    await close_engine()
+
 # -------- register CBB routes --------
 app.include_router(cbb_routes.router, prefix="/api/cbb")
 
+# -------- register NFL routes --------
 app.include_router(nfl_routes.router, prefix="/api/nfl")
