@@ -25,6 +25,9 @@ def _normalize_date_str(yyyymmdd: Optional[str]) -> str:
         raise ValueError("date must be YYYYMMDD or YYYY-MM-DD")
     return q
 
+def _dash(q: str) -> str:
+    return f"{q[:4]}-{q[4:6]}-{q[6:]}"
+
 async def _get(url: str, params: Dict[str, str] | None = None) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=20.0, headers=HEADERS) as client:
         last = None
@@ -35,7 +38,7 @@ async def _get(url: str, params: Dict[str, str] | None = None) -> Dict[str, Any]
                 return r.json()
             except (httpx.RequestError, httpx.HTTPStatusError) as e:
                 last = e
-                await asyncio.sleep(0.7 * (i + 1))
+                await asyncio.sleep(0.6 * (i + 1))
         return {"_error": str(last or "unknown"), "_url": url, "_params": params or {}}
 
 async def _events_from_core(sb: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], bool]:
@@ -60,36 +63,50 @@ def _events_from_site(sb: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], bool]:
 
 # ---------- public fetchers ----------
 async def get_games_for_date(yyyymmdd: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Robust single-day fetcher that tries multiple 'dates' formats and both endpoints:
+      - site.api with range (YYYYMMDD-YYYYMMDD)  <-- most reliable for NFL
+      - site.api with dashed range (YYYY-MM-DD to same)
+      - core.v2 with single, dashed, and range forms
+    """
     q = _normalize_date_str(yyyymmdd)
-    core = await _get(CORE_URL, {"dates": q})
-    core_events, ok = _events_from_core(core)
-    if ok and core_events: return core_events
+    candidates: List[Dict[str, Any]] = []
 
-    site = await _get(SITE_URL, {"dates": q, "limit": "500"})
-    site_events, ok2 = _events_from_site(site)
-    if ok2 and site_events: return site_events
+    # Site API tends to like ranges even for one day
+    candidates.append(("site", {"dates": f"{q}-{q}", "limit": "500"}))
+    candidates.append(("site", {"dates": f"{_dash(q)}-{_dash(q)}", "limit": "500"}))
 
-    # fallback if no explicit date was passed: try yesterday
+    # Core API sometimes accepts these
+    candidates.append(("core", {"dates": q}))
+    candidates.append(("core", {"dates": _dash(q)}))
+    candidates.append(("core", {"dates": f"{q}-{q}"}))
+    candidates.append(("core", {"dates": f"{_dash(q)}-{_dash(q)}"}))
+
+    # try in order
+    for endpoint, params in candidates:
+        if endpoint == "site":
+            sb = await _get(SITE_URL, params)
+            evs, ok = _events_from_site(sb)
+        else:
+            sb = await _get(CORE_URL, params)
+            evs, ok = _events_from_core(sb)
+        if ok and evs:
+            return evs
+
+    # fallback if no explicit date was passed: try yesterday (common for late games)
     if yyyymmdd is None:
         y = datetime.now(ZoneInfo("America/New_York")) - timedelta(days=1)
-        qy = y.strftime("%Y%m%d")
-        core_y = await _get(CORE_URL, {"dates": qy})
-        core_events_y, oky = _events_from_core(core_y)
-        if oky and core_events_y: return core_events_y
-        site_y = await _get(SITE_URL, {"dates": qy, "limit": "500"})
-        site_events_y, oky2 = _events_from_site(site_y)
-        if oky2 and site_events_y: return site_events_y
+        return await get_games_for_date(y.strftime("%Y%m%d"))
+
     return []
 
 async def get_games_for_range(start_yyyymmdd: str, end_yyyymmdd: str) -> List[Dict[str, Any]]:
-    """
-    Gather games across [start, end] inclusive by calling per-day.
-    """
+    """Gather games across [start, end] inclusive by calling per-day."""
     start = datetime.strptime(_normalize_date_str(start_yyyymmdd), "%Y%m%d")
     end = datetime.strptime(_normalize_date_str(end_yyyymmdd), "%Y%m%d")
-    days = int((end - start).days) + 1
+    days = (end - start).days
     out: List[Dict[str, Any]] = []
-    for i in range(days):
+    for i in range(days + 1):
         q = (start + timedelta(days=i)).strftime("%Y%m%d")
         out.extend(await get_games_for_date(q))
     # de-dup by id
