@@ -5,7 +5,7 @@ import asyncio
 import logging
 from typing import Dict, List, Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, HTTPException
 
 from app.models.nfl_props_model import project_player_props
 from app.services.espn_nfl import extract_game_lite, get_games_for_range
@@ -30,6 +30,7 @@ def _build_game_lookup(events: List[dict]) -> Dict[str, dict]:
         out[token] = lite
     return out
 
+# ---------- canonical endpoints (unchanged) ----------
 @router.get("/player_props")
 async def nfl_player_props(
     season: Optional[int] = None,
@@ -155,3 +156,55 @@ async def nfl_player_props_edges(
         "rows": ranked[:max(1, min(limit, 100))],
         "diagnostics": data.get("diagnostics") if debug else None,
     }
+
+# ---------- NEW: natural-language friendly endpoint ----------
+_label_map = {
+    # receiving yards
+    "receivingyards": "recYds",
+    "recyds": "recYds",
+    "rec yds": "recYds",
+    "receiving yds": "recYds",
+    "receiving": "recYds",
+    # receptions
+    "receptions": "receptions",
+    "recs": "receptions",
+    # rushing yards
+    "rushingyards": "rushYds",
+    "rushyds": "rushYds",
+    "rush yds": "rushYds",
+    "rushing yds": "rushYds",
+    "rushing": "rushYds",
+    # passing yards
+    "passingyards": "passYds",
+    "passyds": "passYds",
+    "pass yds": "passYds",
+    "passing yds": "passYds",
+    "passing": "passYds",
+    # passing TDs
+    "passingtds": "passTDs",
+    "pass tds": "passTDs",
+    "pass td": "passTDs",
+}
+
+def _canon_stat(label: str) -> str | None:
+    key = "".join(ch for ch in (label or "").lower() if ch.isalnum() or ch.isspace())
+    key = key.strip()
+    return _label_map.get(key)
+
+@router.get("/player_props/edges_simple")
+async def nfl_player_props_edges_simple(
+    season: Optional[int] = None,
+    week: Optional[int] = None,
+    statLabel: str = Query("receiving yards", description="Natural label: receiving yards | receptions | rushing yards | passing yards | passing tds"),
+    limit: int = 25,
+    bookmakers: Optional[str] = Query(None, description="Comma-separated (optional)"),
+    region: Optional[str] = Query("us", description="Odds API region, e.g. us, us2, eu"),
+    debug: bool = False,
+):
+    canon = _canon_stat(statLabel)
+    if not canon:
+        raise HTTPException(status_code=400, detail="Unsupported statLabel. Use one of: receiving yards, receptions, rushing yards, passing yards, passing tds")
+    # reuse the canonical edges endpoint
+    return await nfl_player_props_edges(
+        season=season, week=week, stat=canon, limit=limit, bookmakers=bookmakers, region=region, debug=debug
+    )
