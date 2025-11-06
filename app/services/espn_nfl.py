@@ -4,15 +4,18 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
-from zoneinfo import ZoneInfo
 
 NY = ZoneInfo("America/New_York")
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
-# ESPN site API (works reliably with date ranges in YYYYMMDD-YYYYMMDD)
-SITE_API = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+# ESPN sometimes rotates where the working host is. Try both:
+BASE_URLS = [
+    "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
+    "https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
+]
 
 
 def _today_yyyymmdd() -> str:
@@ -48,20 +51,44 @@ async def _get_json(url: str, params: Dict[str, Any]) -> Any:
                 return r.json()
             except Exception as e:
                 last = e
-                await asyncio.sleep(0.4 * (i + 1))
+                await asyncio.sleep(0.35 * (i + 1))
         raise last or RuntimeError("unknown http error")
+
+
+async def _try_variants(date_str: str) -> List[Dict[str, Any]]:
+    """
+    Try ESPN host/param variants NFL accepts:
+      - dates=YYYYMMDD
+      - dates=YYYYMMDD-YYYYMMDD
+    Return the first non-empty events list; otherwise [].
+    """
+    candidates: List[tuple[str, Dict[str, Any]]] = []
+    single = {"dates": date_str, "limit": 500}
+    rng = {"dates": f"{date_str}-{date_str}", "limit": 500}
+
+    for base in BASE_URLS:
+        candidates.append((base, single))
+        candidates.append((base, rng))
+
+    for url, params in candidates:
+        try:
+            data = await _get_json(url, params)
+            events = data.get("events") or []
+            if isinstance(events, list) and events:
+                return events
+        except Exception:
+            continue
+    return []
 
 
 async def get_games_for_date(date: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Loads NFL games for a given date using ESPN site.api scoreboard.
-    ESPN wants: dates=YYYYMMDD-YYYYMMDD (inclusive range), not ISO with dashes.
+    Loads NFL games for a given date using robust ESPN variants.
+    If no events are returned, we do NOT jump to adjacent dates automatically here
+    (week-based router handles widening/fallback).
     """
     d = _coerce_yyyymmdd(date)
-    params = {"dates": f"{d}-{d}", "limit": 500}
-    data = await _get_json(SITE_API, params)
-    events = data.get("events") or []
-    return events if isinstance(events, list) else []
+    return await _try_variants(d)
 
 
 async def get_games_for_range(start: datetime, end: datetime) -> List[Dict[str, Any]]:
