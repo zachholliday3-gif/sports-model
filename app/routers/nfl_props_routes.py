@@ -37,6 +37,7 @@ async def nfl_player_props(
     stats: str = Query("recYds,receptions,rushYds,passYds,passTDs", description="Comma list of stats"),
     include_markets: bool = True,
     bookmakers: Optional[str] = Query(None, description="Comma-separated list, e.g. 'draftkings,fanduel'"),
+    region: Optional[str] = Query("us", description="Odds API region, e.g. us, us2, eu"),
     debug: bool = False,
 ):
     """
@@ -51,7 +52,6 @@ async def nfl_player_props(
     games = _build_game_lookup(events)
     logger.info("NFL props: season=%s week=%s games=%d", season, week, len(games))
 
-    # Markets
     bks = [b.strip() for b in (bookmakers or "").split(",") if b.strip()] or None
     market_blob, diag = ({}, {})
     if include_markets:
@@ -64,9 +64,10 @@ async def nfl_player_props(
                     start_iso=start_iso,
                     end_iso=end_iso,
                     bookmakers=bks,
+                    region=region or "us",
                     debug=debug,
                 ),
-                timeout=15.0,
+                timeout=18.0,
             )
         except Exception as e:
             logger.exception("odds props fetch failed: %s", e)
@@ -75,13 +76,11 @@ async def nfl_player_props(
 
     rows: List[dict] = []
 
-    # If odds returned nothing, you still get model-only projections when markets are absent (edges empty)
-    for pkey, entry in (market_blob or {}).items():
+    for _, entry in (market_blob or {}).items():
         team = entry["team"]
         opp = entry["opponent"]
-        token = entry.get("gameToken")
 
-        # neutral anchors for now (no DB)
+        # neutral anchors (can wire to game model later)
         game_total = 43.0
         team_spread_home = 0.0
 
@@ -119,7 +118,7 @@ async def nfl_player_props(
         "week": week,
         "rows": rows,
         "diagnostics": diag if debug else None,
-        "note": "If rows=[], your plan/bookmaker coverage may not include props for this week. Try ?bookmakers=draftkings or remove bookmaker filter.",
+        "note": "If rows is empty, try adding ?bookmakers=draftkings,fanduel or ?region=eu or remove filters.",
     }
 
 
@@ -130,6 +129,7 @@ async def nfl_player_props_edges(
     stat: str = Query("recYds", description="recYds | rushYds | passYds | receptions | passTDs"),
     limit: int = 25,
     bookmakers: Optional[str] = Query(None, description="Comma-separated (optional)"),
+    region: Optional[str] = Query("us", description="Odds API region, e.g. us, us2, eu"),
     debug: bool = False,
 ):
     data = await nfl_player_props(
@@ -138,6 +138,7 @@ async def nfl_player_props_edges(
         stats=stat,
         include_markets=True,
         bookmakers=bookmakers,
+        region=region,
         debug=debug,
     )
     rows = data.get("rows", [])
