@@ -62,49 +62,17 @@ async def _week_games_soft(season: int, week: int) -> tuple[list, dict]:
     return [], {}
 
 
-# ---------------- Schedule (week-based) ----------------
-@router.get("/schedule")
-async def nfl_schedule(
-    season: Optional[int] = None,
-    week: Optional[int] = None,
-):
-    """
-    Get NFL schedule by season+week. If missing, uses the current week.
-    Soft fallback: if requested week returns 0, previous week is returned with a fallback note.
-    """
-    if season and week:
-        games, meta = await _week_games_soft(season, week)
-    else:
-        season, week = current_season_week()
-        games, meta = await _week_games_soft(season, week)
-
-    rows = [extract_game_lite(ev) for ev in games]
-    res = {"rows": rows, "season": meta.get("season", season), "week": meta.get("week", week)}
-    if "fallbackFrom" in meta:
-        res["fallbackFrom"] = meta["fallbackFrom"]
-    logger.info("NFL schedule: season=%s week=%s -> %d", res["season"], res["week"], len(rows))
-    return res
-
-
-# ---------------- Slate (FG projections, week-based) ----------------
-@router.get("/slate")
-async def nfl_slate(
-    season: Optional[int] = None,
-    week: Optional[int] = None,
-    scope: str = Query("FG", pattern="^FG$"),
+async def _build_nfl_slate(
+    season: int,
+    week: int,
     include_markets: bool = False,
-):
-    # IMPORTANT: NFL only supports FG scope
-    if scope != "FG":
-        raise HTTPException(400, "NFL supports FG scope only")
-
-    if season and week:
-        games, meta = await _week_games_soft(season, week)
-        use_season, use_week = meta.get("season", season), meta.get("week", week)
-    else:
-        season, week = current_season_week()
-        games, meta = await _week_games_soft(season, week)
-        use_season, use_week = meta.get("season", season), meta.get("week", week)
+) -> dict:
+    """
+    Internal helper: returns {"season", "week", "rows", optional "fallbackFrom"}.
+    Never call route functions directly (avoids FastAPI Query(...) default issues).
+    """
+    games, meta = await _week_games_soft(season, week)
+    use_season, use_week = meta.get("season", season), meta.get("week", week)
 
     logger.info("NFL slate params: season=%s week=%s include_markets=%s", use_season, use_week, include_markets)
     logger.info("NFL games fetched: %d", len(games))
@@ -141,6 +109,45 @@ async def nfl_slate(
     return res
 
 
+# ---------------- Schedule (week-based) ----------------
+@router.get("/schedule")
+async def nfl_schedule(
+    season: Optional[int] = None,
+    week: Optional[int] = None,
+):
+    """
+    Get NFL schedule by season+week. If missing, uses the current week.
+    Soft fallback: if requested week returns 0, previous week is returned with a fallback note.
+    """
+    if season is None or week is None:
+        season, week = current_season_week()
+    data = await _build_nfl_slate(season=season, week=week, include_markets=False)
+    # Convert to schedule-only shape
+    rows = [{"gameId": r["gameId"], "startTime": r["startTime"], "homeTeam": r["homeTeam"], "awayTeam": r["awayTeam"]} for r in data["rows"]]
+    out = {"season": data["season"], "week": data["week"], "rows": rows}
+    if "fallbackFrom" in data:
+        out["fallbackFrom"] = data["fallbackFrom"]
+    logger.info("NFL schedule: season=%s week=%s -> %d", out["season"], out["week"], len(rows))
+    return out
+
+
+# ---------------- Slate (FG projections, week-based) ----------------
+@router.get("/slate")
+async def nfl_slate(
+    season: Optional[int] = None,
+    week: Optional[int] = None,
+    scope: str = Query("FG", pattern="^FG$"),
+    include_markets: bool = False,
+):
+    # IMPORTANT: NFL only supports FG scope
+    if scope != "FG":
+        raise HTTPException(400, "NFL supports FG scope only")
+
+    if season is None or week is None:
+        season, week = current_season_week()
+    return await _build_nfl_slate(season=season, week=week, include_markets=include_markets)
+
+
 # ---------------- Edges (ranked, week-based) ----------------
 @router.get("/edges")
 async def nfl_edges(
@@ -149,7 +156,10 @@ async def nfl_edges(
     sort: str = Query("spread", pattern="^(spread|total)$"),
     limit: int = 25,
 ):
-    data = await nfl_slate(season=season, week=week, include_markets=True)
+    if season is None or week is None:
+        season, week = current_season_week()
+
+    data = await _build_nfl_slate(season=season, week=week, include_markets=True)
     rows = data.get("rows", [])
     key = "spreadHome" if sort == "spread" else "total"
 
@@ -168,7 +178,7 @@ async def nfl_edges(
 @router.get("/this_week")
 async def nfl_this_week(include_markets: bool = False):
     season, week = current_season_week()
-    return await nfl_slate(season=season, week=week, include_markets=include_markets)
+    return await _build_nfl_slate(season=season, week=week, include_markets=include_markets)
 
 @router.get("/week")
 async def nfl_week_slate(
@@ -176,7 +186,7 @@ async def nfl_week_slate(
     week: int,
     include_markets: bool = False,
 ):
-    return await nfl_slate(season=season, week=week, include_markets=include_markets)
+    return await _build_nfl_slate(season=season, week=week, include_markets=include_markets)
 
 
 # ---------------- GPT-friendly simple endpoints ----------------
@@ -197,21 +207,23 @@ async def nfl_projections_simple(
     w = (when or "this_week").strip().lower()
 
     if season and week:
-        return await nfl_week_slate(season=season, week=week, include_markets=include_markets)
+        return await _build_nfl_slate(season=season, week=week, include_markets=include_markets)
 
     if w == "this_week":
-        return await nfl_this_week(include_markets=include_markets)
+        s, wk = current_season_week()
+        return await _build_nfl_slate(season=s, week=wk, include_markets=include_markets)
 
     if w.startswith("week:"):
         try:
             _, rest = w.split(":", 1)
             y_str, wk_str = rest.split(":")
-            return await nfl_week_slate(season=int(y_str), week=int(wk_str), include_markets=include_markets)
+            return await _build_nfl_slate(season=int(y_str), week=int(wk_str), include_markets=include_markets)
         except Exception:
             pass
 
     # Fallback to current week
-    return await nfl_this_week(include_markets=include_markets)
+    s, wk = current_season_week()
+    return await _build_nfl_slate(season=s, week=wk, include_markets=include_markets)
 
 
 @router.get("/edges_simple")
@@ -222,7 +234,11 @@ async def nfl_edges_simple(
     sort: str = Query("spread", pattern="^(spread|total)$"),
     limit: int = 25,
 ):
-    data = await nfl_projections_simple(when=when, season=season, week=week, include_markets=True)
+    if season and week:
+        data = await _build_nfl_slate(season=season, week=week, include_markets=True)
+    else:
+        data = await nfl_projections_simple(when=when, include_markets=True)  # will call _build_nfl_slate under the hood
+
     rows = data.get("rows", []) if isinstance(data, dict) else (data or [])
     key = "spreadHome" if sort == "spread" else "total"
 
@@ -235,3 +251,4 @@ async def nfl_edges_simple(
     if isinstance(data, dict) and "fallbackFrom" in data:
         return {"season": data.get("season"), "week": data.get("week"), "fallbackFrom": data["fallbackFrom"], "rows": out}
     return out
+
