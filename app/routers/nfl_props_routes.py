@@ -31,7 +31,6 @@ def _build_game_lookup(events: List[dict]) -> Dict[str, dict]:
         out[token] = lite
     return out
 
-# utility: we just pass through whatever week_window gives us (str or datetime) to the service
 def _week_bounds(season: int, week: int) -> Tuple[Union[str, datetime], Union[str, datetime]]:
     return week_window(season, week)
 
@@ -44,6 +43,7 @@ async def nfl_player_props(
     bookmakers: Optional[str] = Query(None, description="Comma-separated list, e.g. 'draftkings,fanduel'"),
     region: Optional[str] = Query("us", description="Odds API region, e.g. us, us2, eu"),
     debug: bool = False,
+    fast: bool = Query(False, description="If true, use quick path (recYds only, no bookmaker filter) for lower latency"),
 ):
     """
     Returns list of player prop projections (and edges when markets available).
@@ -51,13 +51,23 @@ async def nfl_player_props(
     if season is None or week is None:
         season, week = current_season_week()
 
-    want_stats = [s.strip() for s in stats.split(",") if s.strip()]
+    # Fast path narrows scope to make Actions timeouts happy
+    if fast:
+        want_stats = ["recYds"]
+        bks = None
+        region = region or "us"
+        wait_secs = 8.0
+    else:
+        want_stats = [s.strip() for s in stats.split(",") if s.strip()]
+        bks = [b.strip() for b in (bookmakers or "").split(",") if b.strip()] or None
+        region = region or "us"
+        wait_secs = 18.0
+
     start_bound, end_bound = _week_bounds(season, week)
     events = await _week_games(season, week)
     games = _build_game_lookup(events)
-    logger.info("NFL props: season=%s week=%s games=%d", season, week, len(games))
+    logger.info("NFL props: season=%s week=%s games=%d fast=%s", season, week, len(games), fast)
 
-    bks = [b.strip() for b in (bookmakers or "").split(",") if b.strip()] or None
     market_blob, diag = ({}, {})
     if include_markets:
         try:
@@ -69,10 +79,10 @@ async def nfl_player_props(
                     start_iso=start_bound,
                     end_iso=end_bound,
                     bookmakers=bks,
-                    region=region or "us",
+                    region=region,
                     debug=debug,
                 ),
-                timeout=20.0,
+                timeout=wait_secs,
             )
         except Exception as e:
             logger.exception("odds props fetch failed: %s", e)
@@ -80,8 +90,6 @@ async def nfl_player_props(
             diag = {"error": "fetch_failed"}
 
     rows: List[dict] = []
-
-    # If odds returned nothing, you still get model-only projections when markets are absent (edges empty)
     for _, entry in (market_blob or {}).items():
         team = entry["team"]
         opp = entry["opponent"]
@@ -123,7 +131,7 @@ async def nfl_player_props(
         "week": week,
         "rows": rows,
         "diagnostics": diag if debug else None,
-        "note": "If rows is empty, try adding ?bookmakers=draftkings,fanduel or ?region=eu or remove filters.",
+        "note": "Use fast=true for quicker responses (recYds only, all books).",
     }
 
 @router.get("/player_props/edges")
@@ -135,6 +143,7 @@ async def nfl_player_props_edges(
     bookmakers: Optional[str] = Query(None, description="Comma-separated (optional)"),
     region: Optional[str] = Query("us", description="Odds API region, e.g. us, us2, eu"),
     debug: bool = False,
+    fast: bool = Query(False, description="Use quick path for lower latency"),
 ):
     data = await nfl_player_props(
         season=season,
@@ -144,6 +153,7 @@ async def nfl_player_props_edges(
         bookmakers=bookmakers,
         region=region,
         debug=debug,
+        fast=fast,
     )
     rows = data.get("rows", [])
 
@@ -160,9 +170,7 @@ async def nfl_player_props_edges(
         "diagnostics": data.get("diagnostics") if debug else None,
     }
 
-# Natural-language mapping endpoint stays as you had it (edges_simple)
-from fastapi import HTTPException  # ensure imported above if not already
-
+# Natural-language mapping endpoint (defaults to fast=True)
 _label_map = {
     "receivingyards": "recYds", "recyds": "recYds", "rec yds": "recYds", "receiving yds": "recYds", "receiving": "recYds",
     "receptions": "receptions", "recs": "receptions",
@@ -179,14 +187,15 @@ async def nfl_player_props_edges_simple(
     season: Optional[int] = None,
     week: Optional[int] = None,
     statLabel: str = Query("receiving yards"),
-    limit: int = 25,
+    limit: int = 15,
     bookmakers: Optional[str] = Query(None),
     region: Optional[str] = Query("us"),
     debug: bool = False,
+    fast: bool = Query(True, description="Default fast mode for Actions"),
 ):
     canon = _canon_stat(statLabel)
     if not canon:
         raise HTTPException(status_code=400, detail="Unsupported statLabel. Use receiving yards | receptions | rushing yards | passing yards | passing tds")
     return await nfl_player_props_edges(
-        season=season, week=week, stat=canon, limit=limit, bookmakers=bookmakers, region=region, debug=debug
+        season=season, week=week, stat=canon, limit=limit, bookmakers=bookmakers, region=region, debug=debug, fast=fast
     )
