@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Union
+from datetime import datetime
 
 from fastapi import APIRouter, Query, HTTPException
 
@@ -30,7 +31,10 @@ def _build_game_lookup(events: List[dict]) -> Dict[str, dict]:
         out[token] = lite
     return out
 
-# ---------- canonical endpoints (unchanged) ----------
+# utility: we just pass through whatever week_window gives us (str or datetime) to the service
+def _week_bounds(season: int, week: int) -> Tuple[Union[str, datetime], Union[str, datetime]]:
+    return week_window(season, week)
+
 @router.get("/player_props")
 async def nfl_player_props(
     season: Optional[int] = None,
@@ -48,7 +52,7 @@ async def nfl_player_props(
         season, week = current_season_week()
 
     want_stats = [s.strip() for s in stats.split(",") if s.strip()]
-    start_iso, end_iso = week_window(season, week)
+    start_bound, end_bound = _week_bounds(season, week)
     events = await _week_games(season, week)
     games = _build_game_lookup(events)
     logger.info("NFL props: season=%s week=%s games=%d", season, week, len(games))
@@ -62,13 +66,13 @@ async def nfl_player_props(
                     season=season,
                     week=week,
                     want_stats=want_stats,
-                    start_iso=start_iso,
-                    end_iso=end_iso,
+                    start_iso=start_bound,
+                    end_iso=end_bound,
                     bookmakers=bks,
                     region=region or "us",
                     debug=debug,
                 ),
-                timeout=18.0,
+                timeout=20.0,
             )
         except Exception as e:
             logger.exception("odds props fetch failed: %s", e)
@@ -77,11 +81,11 @@ async def nfl_player_props(
 
     rows: List[dict] = []
 
+    # If odds returned nothing, you still get model-only projections when markets are absent (edges empty)
     for _, entry in (market_blob or {}).items():
         team = entry["team"]
         opp = entry["opponent"]
 
-        # neutral anchors (can wire to game model later)
         game_total = 43.0
         team_spread_home = 0.0
 
@@ -122,7 +126,6 @@ async def nfl_player_props(
         "note": "If rows is empty, try adding ?bookmakers=draftkings,fanduel or ?region=eu or remove filters.",
     }
 
-
 @router.get("/player_props/edges")
 async def nfl_player_props_edges(
     season: Optional[int] = None,
@@ -157,54 +160,33 @@ async def nfl_player_props_edges(
         "diagnostics": data.get("diagnostics") if debug else None,
     }
 
-# ---------- NEW: natural-language friendly endpoint ----------
-_label_map = {
-    # receiving yards
-    "receivingyards": "recYds",
-    "recyds": "recYds",
-    "rec yds": "recYds",
-    "receiving yds": "recYds",
-    "receiving": "recYds",
-    # receptions
-    "receptions": "receptions",
-    "recs": "receptions",
-    # rushing yards
-    "rushingyards": "rushYds",
-    "rushyds": "rushYds",
-    "rush yds": "rushYds",
-    "rushing yds": "rushYds",
-    "rushing": "rushYds",
-    # passing yards
-    "passingyards": "passYds",
-    "passyds": "passYds",
-    "pass yds": "passYds",
-    "passing yds": "passYds",
-    "passing": "passYds",
-    # passing TDs
-    "passingtds": "passTDs",
-    "pass tds": "passTDs",
-    "pass td": "passTDs",
-}
+# Natural-language mapping endpoint stays as you had it (edges_simple)
+from fastapi import HTTPException  # ensure imported above if not already
 
+_label_map = {
+    "receivingyards": "recYds", "recyds": "recYds", "rec yds": "recYds", "receiving yds": "recYds", "receiving": "recYds",
+    "receptions": "receptions", "recs": "receptions",
+    "rushingyards": "rushYds", "rushyds": "rushYds", "rush yds": "rushYds", "rushing yds": "rushYds", "rushing": "rushYds",
+    "passingyards": "passYds", "passyds": "passYds", "pass yds": "passYds", "passing yds": "passYds", "passing": "passYds",
+    "passingtds": "passTDs", "pass tds": "passTDs", "pass td": "passTDs",
+}
 def _canon_stat(label: str) -> str | None:
-    key = "".join(ch for ch in (label or "").lower() if ch.isalnum() or ch.isspace())
-    key = key.strip()
+    key = "".join(ch for ch in (label or "").lower() if ch.isalnum() or ch.isspace()).strip()
     return _label_map.get(key)
 
 @router.get("/player_props/edges_simple")
 async def nfl_player_props_edges_simple(
     season: Optional[int] = None,
     week: Optional[int] = None,
-    statLabel: str = Query("receiving yards", description="Natural label: receiving yards | receptions | rushing yards | passing yards | passing tds"),
+    statLabel: str = Query("receiving yards"),
     limit: int = 25,
-    bookmakers: Optional[str] = Query(None, description="Comma-separated (optional)"),
-    region: Optional[str] = Query("us", description="Odds API region, e.g. us, us2, eu"),
+    bookmakers: Optional[str] = Query(None),
+    region: Optional[str] = Query("us"),
     debug: bool = False,
 ):
     canon = _canon_stat(statLabel)
     if not canon:
-        raise HTTPException(status_code=400, detail="Unsupported statLabel. Use one of: receiving yards, receptions, rushing yards, passing yards, passing tds")
-    # reuse the canonical edges endpoint
+        raise HTTPException(status_code=400, detail="Unsupported statLabel. Use receiving yards | receptions | rushing yards | passing yards | passing tds")
     return await nfl_player_props_edges(
         season=season, week=week, stat=canon, limit=limit, bookmakers=bookmakers, region=region, debug=debug
     )

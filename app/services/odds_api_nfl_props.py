@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import asyncio
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from datetime import datetime, timezone
 
 import httpx
@@ -26,10 +26,10 @@ MARKET_MAP = {
 def _norm(s: str) -> str:
     return "".join(ch for ch in (s or "").lower() if ch.isalnum())
 
-# ---------- NEW: safe datetime helpers ----------
-def _to_dt(v) -> Optional[datetime]:
+# ---------- SAFE DATETIME HELPERS ----------
+def _to_dt(v: Union[str, datetime, None]) -> Optional[datetime]:
     """
-    Accepts ISO string (with or without 'Z'), naive/aware datetime, or None.
+    Accepts ISO string (with or without 'Z'), datetime (naive or aware), or None.
     Returns timezone-aware UTC datetime, or None if parsing fails.
     """
     if v is None:
@@ -38,35 +38,44 @@ def _to_dt(v) -> Optional[datetime]:
         return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
     if isinstance(v, str):
         s = v.strip()
-        # Odds API often returns '...Z' — make it RFC3339 compatible
+        if not s:
+            return None
+        # Normalize Z suffix to +00:00 for fromisoformat
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
+        # Some providers return like "2025-11-06T01:20:00.000Z" -> handled by above
+        # Some return date-only "2025-11-06" -> interpret as midnight UTC
         try:
             dt = datetime.fromisoformat(s)
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         except Exception:
-            return None
+            try:
+                dt = datetime.fromisoformat(s + "T00:00:00+00:00")
+            except Exception:
+                return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     return None
 
-def _within_iso(iso_ts: str, start_iso: Optional[str | datetime], end_iso: Optional[str | datetime]) -> bool:
+def _within_iso(iso_ts: Union[str, datetime, None],
+                start_iso: Union[str, datetime, None],
+                end_iso: Union[str, datetime, None]) -> bool:
     """
-    True if iso_ts is within [start_iso, end_iso] (inclusive).
-    Accepts strings or datetimes for all three params.
-    If start/end are missing, treats the range as open.
+    True if iso_ts ∈ [start_iso, end_iso]. Handles str/datetime/None robustly.
+    If start/end missing, treats the range as open on that side.
+    If event time can't be parsed, conservatively keep it when bounds are open, else drop it.
     """
     t = _to_dt(iso_ts)
     s = _to_dt(start_iso)
     e = _to_dt(end_iso)
 
     if t is None:
-        # If we can’t parse the event time, keep it only if no bounds are set
+        # keep only if no bounds (otherwise we can't safely compare)
         return not (s or e)
     if s and t < s:
         return False
     if e and t > e:
         return False
     return True
-# ---------- /NEW ----------
+# -------------------------------------------
 
 async def _get(client: httpx.AsyncClient, path: str, params: Dict[str, Any]) -> Any:
     try:
@@ -167,8 +176,8 @@ async def get_nfl_player_prop_lines(
     want_stats: List[str] | None = None,
     region: str = "us",
     bookmakers: Optional[List[str]] = None,
-    start_iso: Optional[str | datetime] = None,   # <-- accept str or datetime
-    end_iso: Optional[str | datetime] = None,     # <-- accept str or datetime
+    start_iso: Union[str, datetime, None] = None,
+    end_iso: Union[str, datetime, None] = None,
     debug: bool = False,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
     """
@@ -199,27 +208,25 @@ async def get_nfl_player_prop_lines(
         all_events = await _list_events(client)
         diag["events_total"] = len(all_events)
 
-        # --- FIXED: always normalize week bounds & filter safely ---
-        events_window = [e for e in all_events if _within_iso(e.get("commence_time", ""), start_iso, end_iso)]
+        # SAFE: normalize window comparison
+        events_window = [e for e in all_events if _within_iso(e.get("commence_time"), start_iso, end_iso)]
         diag["events_in_window"] = len(events_window)
-        # -----------------------------------------------------------
 
-        # degrade ladder for coverage
         attempts = [
-            {"markets": base_markets, "bookmakers": bookmakers, "window_only": True,  "label": "requested+books+window"},
-            {"markets": ["player_reception_yds"], "bookmakers": bookmakers, "window_only": True,  "label": "recYds+books+window"},
-            {"markets": base_markets, "bookmakers": None,      "window_only": True,  "label": "requested+allbooks+window"},
-            {"markets": ["player_reception_yds"], "bookmakers": None,      "window_only": True,  "label": "recYds+allbooks+window"},
-            {"markets": base_markets, "bookmakers": bookmakers, "window_only": False, "label": "requested+books+allEvents"},
-            {"markets": base_markets, "bookmakers": None,      "window_only": False, "label": "requested+allbooks+allEvents"},
-            {"markets": ["player_reception_yds"], "bookmakers": None,      "window_only": False, "label": "recYds+allbooks+allEvents"},
+            {"markets": base_markets,              "bookmakers": bookmakers, "window_only": True,  "label": "requested+books+window"},
+            {"markets": ["player_reception_yds"],  "bookmakers": bookmakers, "window_only": True,  "label": "recYds+books+window"},
+            {"markets": base_markets,              "bookmakers": None,       "window_only": True,  "label": "requested+allbooks+window"},
+            {"markets": ["player_reception_yds"],  "bookmakers": None,       "window_only": True,  "label": "recYds+allbooks+window"},
+            {"markets": base_markets,              "bookmakers": bookmakers, "window_only": False, "label": "requested+books+allEvents"},
+            {"markets": base_markets,              "bookmakers": None,       "window_only": False, "label": "requested+allbooks+allEvents"},
+            {"markets": ["player_reception_yds"],  "bookmakers": None,       "window_only": False, "label": "recYds+allbooks+allEvents"},
         ]
 
         out_total: Dict[str, Dict[str, Any]] = {}
 
         for att in attempts:
             diag["attempts"].append(att["label"])
-            events = events_window if att["window_only"] and events_window else all_events
+            events = events_window if (att["window_only"] and events_window) else all_events
             props, queried = await _collect_for_events(
                 client, events, att["markets"], region=region, bookmakers=att["bookmakers"]
             )
@@ -228,11 +235,10 @@ async def get_nfl_player_prop_lines(
             if props:
                 break
 
-    # Count events that yielded any props (rough proxy using gameToken presence)
+    # Count events with any props (proxy using gameToken presence)
     game_tokens = set(v.get("gameToken") for v in out_total.values() if v.get("gameToken"))
     diag["events_with_any_props"] = len(game_tokens)
 
-    # sample
     for _, v in out_total.items():
         diag["sample"] = {"player": v["player"], "team": v["team"], "markets": v["markets"], "book": v["book"]}
         break
