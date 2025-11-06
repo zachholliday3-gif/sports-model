@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -21,6 +22,33 @@ router = APIRouter(tags=["cbb"])
 
 def _norm(s: str) -> str:
     return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+def _resolve_when_to_date(when: Optional[str]) -> Optional[str]:
+    """
+    Maps 'today'/'tomorrow'/'yesterday' or 'date:YYYYMMDD' -> 'YYYYMMDD'.
+    Returns None to indicate 'today' by default (handled in service).
+    """
+    if not when:
+        return None
+    w = when.strip().lower()
+    now = datetime.now().astimezone()
+    if w == "today":
+        return now.strftime("%Y%m%d")
+    if w == "tomorrow":
+        return (now + timedelta(days=1)).strftime("%Y%m%d")
+    if w == "yesterday":
+        return (now - timedelta(days=1)).strftime("%Y%m%d")
+    if w.startswith("date:"):
+        ds = w.split(":", 1)[1].strip()
+        # accept YYYYMMDD or YYYY-MM-DD
+        if len(ds) == 10 and ds[4] == "-" and ds[7] == "-":
+            try:
+                return datetime.strptime(ds, "%Y-%m-%d").strftime("%Y%m%d")
+            except Exception:
+                return None
+        if len(ds) == 8 and ds.isdigit():
+            return ds
+    return None
 
 
 # -------- Schedule --------
@@ -118,7 +146,7 @@ async def cbb_edges(
     return ranked[:max(1, min(limit, 100))]
 
 
-# -------- Projections alias (for GPT intent) --------
+# -------- Projections alias (legacy) --------
 @router.get("/projections")
 async def cbb_projections_api(
     date: Optional[str] = None,
@@ -128,7 +156,7 @@ async def cbb_projections_api(
     return await cbb_slate(date=date, scope=scope, include_markets=include_markets)
 
 
-# -------- Single matchup (optional) --------
+# -------- Single matchup --------
 @router.get("/matchups/{gameId}", response_model=MatchupDetail)
 async def cbb_matchup(gameId: str, scope: str = "1H"):
     try:
@@ -154,3 +182,42 @@ async def cbb_matchup(gameId: str, scope: str = "1H"):
         }
 
     return {**base, "notes": None, "model": {"gameId": base["gameId"], "scope": scope, **model}}
+
+
+# -------- GPT-friendly SIMPLE endpoints --------
+@router.get("/projections_simple")
+async def cbb_projections_simple(
+    when: Optional[str] = None,
+    date: Optional[str] = None,
+    scope: str = Query("1H", pattern="^(1H|FG)$"),
+    include_markets: bool = False,
+):
+    """
+    One-call CBB projections for GPT.
+    Use 'when' = today|tomorrow|yesterday|date:YYYYMMDD (date param also supported).
+    """
+    resolved = _resolve_when_to_date(when) or date
+    return await cbb_slate(date=resolved, scope=scope, include_markets=include_markets)
+
+
+@router.get("/edges_simple")
+async def cbb_edges_simple(
+    when: Optional[str] = None,
+    date: Optional[str] = None,
+    scope: str = Query("1H", pattern="^(1H|FG)$"),
+    sort: str = Query("spread", pattern="^(spread|total)$"),
+    limit: int = 25,
+):
+    """
+    Ranked edges for GPT with simple date language.
+    """
+    resolved = _resolve_when_to_date(when) or date
+    rows = await cbb_slate(date=resolved, scope=scope, include_markets=True)
+    key = "spreadHome" if sort == "spread" else "total"
+
+    def _abs_edge(row):
+        val = (row.get("edge") or {}).get(key)
+        return abs(val) if isinstance(val, (int, float)) else -1.0
+
+    ranked = sorted(rows, key=_abs_edge, reverse=True)
+    return ranked[:max(1, min(limit, 100))]
