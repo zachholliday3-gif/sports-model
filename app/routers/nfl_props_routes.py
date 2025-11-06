@@ -8,11 +8,9 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, Query
 
 from app.models.nfl_props_model import project_player_props
-from app.services.nfl_weeks import current_season_week
 from app.services.espn_nfl import extract_game_lite, get_games_for_range
+from app.services.nfl_weeks import current_season_week, week_window
 from app.services.odds_api_nfl_props import get_nfl_player_prop_lines
-
-from app.services.nfl_weeks import week_window
 
 logger = logging.getLogger("app.nfl_props")
 router = APIRouter(tags=["nfl-props"])
@@ -36,34 +34,35 @@ def _build_game_lookup(events: List[dict]) -> Dict[str, dict]:
 async def nfl_player_props(
     season: Optional[int] = None,
     week: Optional[int] = None,
-    stats: str = Query("passYds,passTDs,rushYds,recYds,receptions", description="Comma list of stats"),
+    stats: str = Query("recYds,rushYds,passYds,receptions,passTDs", description="Comma list of stats"),
     include_markets: bool = True,
 ):
     """
     Returns list of player prop projections (and edges when markets available).
-    Shape per row:
-      {
-        player, team, opponent, position,
-        model: { passYds?, passTDs?, rushYds?, recYds?, receptions? },
-        market: { stat: line?, book? },
-        edge:   { stat: model - market }
-      }
     """
     if season is None or week is None:
         season, week = current_season_week()
 
     want_stats = [s.strip() for s in stats.split(",") if s.strip()]
+
+    # Get the week’s ISO window and schedule (for opponent/context)
+    start_iso, end_iso = week_window(season, week)
     events = await _week_games(season, week)
     games = _build_game_lookup(events)
     logger.info("NFL props: season=%s week=%s games=%d", season, week, len(games))
 
-    # Pull markets (this also gives us the player list)
     market_blob = {}
     if include_markets:
         try:
             market_blob = await asyncio.wait_for(
-                get_nfl_player_prop_lines(season=season, week=week, want_stats=want_stats),
-                timeout=10.0
+                get_nfl_player_prop_lines(
+                    season=season,
+                    week=week,
+                    want_stats=want_stats,
+                    start_iso=start_iso,
+                    end_iso=end_iso,
+                ),
+                timeout=12.0,
             )
         except Exception as e:
             logger.exception("odds props fetch failed: %s", e)
@@ -71,23 +70,15 @@ async def nfl_player_props(
 
     rows: List[dict] = []
 
-    # For each player entry from markets, compute model + edges
     for pkey, entry in (market_blob or {}).items():
         team = entry["team"]
         opp = entry["opponent"]
         token = entry.get("gameToken")
         g = games.get(token)
 
-        # If we can, pull model inputs from the game (proj total/spread) using our existing team model
-        if g:
-            # crude mapping from our FG game model (we project FG totals/spreads at the game level already)
-            # Use a neutral total/spread if none available in schedule
-            # Since we don't have per-game projections stored here, we just assume league avg 43 and spread 0
-            game_total = 43.0
-            team_spread_home = 0.0 if team == g["homeTeam"] else 0.0
-        else:
-            game_total = 43.0
-            team_spread_home = 0.0
+        # Use neutral anchors when we don't have a modeled FG line handy
+        game_total = 43.0
+        team_spread_home = 0.0
 
         proj = project_player_props(
             player_name=entry["player"],
@@ -98,7 +89,6 @@ async def nfl_player_props(
             team_spread_home=team_spread_home,
         )
 
-        # Filter projection to requested stats only
         proj_filt = {k: v for k, v in proj.items() if k in want_stats}
 
         market = {}
@@ -125,7 +115,7 @@ async def nfl_player_props(
         "season": season,
         "week": week,
         "rows": rows,
-        "note": "Projections are heuristic baselines adjusted by pace/spread; markets used when available.",
+        "note": "Player props pulled per-event via Odds API; projections are baseline-paced.",
     }
 
 
@@ -133,12 +123,9 @@ async def nfl_player_props(
 async def nfl_player_props_edges(
     season: Optional[int] = None,
     week: Optional[int] = None,
-    stat: str = Query("recYds", description="Which stat to rank by (e.g. recYds,rushYds,passYds,receptions,passTDs)"),
+    stat: str = Query("recYds", description="recYds | rushYds | passYds | receptions | passTDs"),
     limit: int = 25,
 ):
-    """
-    Ranked edges for a single stat (descending by absolute edge).
-    """
     data = await nfl_player_props(season=season, week=week, stats=stat, include_markets=True)
     rows = data.get("rows", [])
 
