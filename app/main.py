@@ -9,6 +9,8 @@ import os
 
 # Routers
 from app.routers import cbb_routes, nfl_routes
+from app.routers import nfl_props_routes
+
 
 # ------------ Logging ------------
 logging.basicConfig(level=logging.INFO)
@@ -75,3 +77,5 @@ async def status():
 # Mount routers
 app.include_router(cbb_routes.router, prefix="/api/cbb")
 app.include_router(nfl_routes.router, prefix="/api/nfl")
+app.include_router(nfl_props_routes.router, prefix="/api/nfl")
+
