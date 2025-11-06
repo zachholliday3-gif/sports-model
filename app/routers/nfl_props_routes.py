@@ -28,16 +28,30 @@ def _pos_ok(entry_pos: Optional[str], want: Optional[set]) -> bool:
         return bool({"WR", "TE"} & want)
     return entry_pos in want
 
-_label_map = {
-    "receivingyards": "recYds", "recyds": "recYds", "rec yds": "recYds", "receiving yds": "recYds", "receiving": "recYds",
-    "receptions": "receptions", "recs": "receptions",
-    "rushingyards": "rushYds", "rushyds": "rushYds", "rush yds": "rushYds", "rushing yds": "rushYds", "rushing": "rushYds",
-    "passingyards": "passYds", "passyds": "passYds", "pass yds": "passYds", "passing yds": "passYds", "passing": "passYds",
-    "passingtds": "passTDs", "pass tds": "passTDs", "pass td": "passTDs",
+# ---------- robust stat label normalization ----------
+# Drop ALL non-alphanumeric characters so:
+# "receiving yards", "ReceivingYards", "receiving-yards" -> "receivingyards"
+def _canon_key(label: str) -> str:
+    return "".join(ch for ch in (label or "").lower() if ch.isalnum())
+
+_LABEL_TO_CANON = {
+    "receivingyards": "recYds",
+    "receptions": "receptions",
+    "rushingyards": "rushYds",
+    "passingyards": "passYds",
+    "passingtds": "passTDs",
+    # extras/aliases
+    "recyds": "recYds",
+    "receiving": "recYds",
+    "rushing": "rushYds",
+    "passing": "passYds",
+    "passtds": "passTDs",
+    "passtd": "passTDs",
+    "passtouchdowns": "passTDs",
 }
 def _canon_stat(label: str) -> str | None:
-    key = "".join(ch for ch in (label or "").lower() if ch.isalnum() or ch.isspace()).strip()
-    return _label_map.get(key)
+    return _LABEL_TO_CANON.get(_canon_key(label))
+# -----------------------------------------------------
 
 @router.get("/player_props")
 async def nfl_player_props(
@@ -58,7 +72,6 @@ async def nfl_player_props(
     bks = [b.strip() for b in (bookmakers or "").split(",") if b.strip()] or None
     start_bound, end_bound = week_window(season, week)
 
-    # Hard wall timeout for Actions
     wait_secs = 6.0 if fast else 12.0
 
     try:
@@ -167,15 +180,7 @@ async def nfl_player_props_edges_simple(
     fast: bool = Query(True, description="Default fast mode for Actions"),
     positions: Optional[str] = Query(None, description="CSV; defaults to WR,TE for receiving/receptions"),
 ):
-    key = "".join(ch for ch in (statLabel or "").lower() if ch.isalnum() or ch.isspace()).strip()
-    canon = {
-        "receivingyards": "recYds", "recyds": "recYds", "rec yds": "recYds", "receiving yds": "recYds", "receiving": "recYds",
-        "receptions": "receptions", "recs": "receptions",
-        "rushingyards": "rushYds", "rushyds": "rushYds", "rush yds": "rushYds", "rushing yds": "rushYds", "rushing": "rushYds",
-        "passingyards": "passYds", "passyds": "passYds", "pass yds": "passYds", "passing yds": "passYds", "passing": "passYds",
-        "passingtds": "passTDs", "pass tds": "passTDs", "pass td": "passTDs",
-    }.get(key)
-
+    canon = _canon_stat(statLabel)
     if not canon:
         raise HTTPException(status_code=400, detail="Unsupported statLabel.")
 
@@ -183,9 +188,8 @@ async def nfl_player_props_edges_simple(
         positions = "WR,TE"
 
     data = await nfl_player_props_edges(
-        season=season, week=week, stat=canon, limit=limit, bookmakers=bookmakers, region=region,
-        debug=debug, fast=fast, positions=positions,
+        season=season, week=week, stat=canon, limit=limit,
+        bookmakers=bookmakers, region=region, debug=debug, fast=fast, positions=positions,
     )
-    # Ensure we never blow out GPT time limits with huge payloads
     data["rows"] = data.get("rows", [])[:max(1, min(limit, 25))]
     return data
