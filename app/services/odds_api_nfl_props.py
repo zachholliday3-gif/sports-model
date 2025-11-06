@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import asyncio
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -13,13 +13,13 @@ SPORT = "americanfootball_nfl"
 
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
-# Correct market keys for NFL props (per The Odds API docs)
+# Correct market keys for NFL props
 # https://the-odds-api.com/sports-odds-data/betting-markets.html
 MARKET_MAP = {
     "player_pass_yds": "passYds",
     "player_pass_tds": "passTDs",
     "player_rush_yds": "rushYds",
-    "player_reception_yds": "recYds",     # <- important fix (was player_rec_yds)
+    "player_reception_yds": "recYds",
     "player_receptions": "receptions",
 }
 
@@ -32,7 +32,7 @@ async def _get(client: httpx.AsyncClient, path: str, params: Dict[str, Any]) -> 
     return r.json()
 
 async def _list_events(client: httpx.AsyncClient) -> List[dict]:
-    # Free: returns id, teams, commence_time (no odds). We’ll time-filter on the caller side.
+    # events list (no odds)
     return await _get(client, f"/sports/{SPORT}/events", {"apiKey": ODDS_API_KEY})
 
 async def _event_odds(
@@ -52,7 +52,9 @@ async def _event_odds(
         params["bookmakers"] = ",".join(bookmakers)
     return await _get(client, f"/sports/{SPORT}/events/{event_id}/odds", params)
 
-def _within_iso_window(iso_ts: str, start_iso: str, end_iso: str) -> bool:
+def _within_iso(iso_ts: str, start_iso: Optional[str], end_iso: Optional[str]) -> bool:
+    if not start_iso or not end_iso:
+        return True
     return (iso_ts >= start_iso) and (iso_ts <= end_iso)
 
 async def get_nfl_player_prop_lines(
@@ -63,40 +65,47 @@ async def get_nfl_player_prop_lines(
     bookmakers: Optional[List[str]] = None,
     start_iso: Optional[str] = None,
     end_iso: Optional[str] = None,
-) -> Dict[str, Dict[str, Any]]:
+    debug: bool = False,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
     """
-    Returns a dict keyed by player-token: {
-      "playerToken|TEAM|OPP": {
-         player, team, opponent, position:None, book, markets:{stat: line}, gameToken
-      }
-    }
+    Returns:
+      (props_by_player, diagnostics)
 
-    Implementation details:
-      * Fetch the week's events (id/home/away/commence_time)
-      * For each event, call /events/{eventId}/odds with desired player prop markets
-      * Aggregate best-available line per stat across bookmakers
+      props_by_player: {
+        "playerToken|TEAM|OPP": {
+          player, team, opponent, position: None, book, markets:{stat: line}, gameToken
+        }
+      }
+
+      diagnostics: counts and sample to understand coverage.
     """
+    diag = {"events_total": 0, "events_in_window": 0, "events_with_markets": 0, "queried": 0, "sample": None}
     if not ODDS_API_KEY:
-        return {}
+        diag["note"] = "ODDS_API_KEY missing"
+        return {}, diag
 
     want_stats = want_stats or ["recYds", "receptions", "rushYds", "passYds", "passTDs"]
-    # Map requested normalized stats -> official Odds API market keys
     rev = {v: k for k, v in MARKET_MAP.items()}
     requested_markets = [rev[s] for s in want_stats if s in rev]
     if not requested_markets:
-        return {}
+        diag["note"] = "no recognized markets requested"
+        return {}, diag
 
     out: Dict[str, Dict[str, Any]] = {}
 
     async with httpx.AsyncClient(timeout=15.0, headers=HEADERS) as client:
         events = await _list_events(client)
+        diag["events_total"] = len(events or [])
 
-        # If caller passed a time window, trim to that; otherwise leave as-is (this_week endpoints usually pass window)
-        if start_iso and end_iso:
-            events = [e for e in events or [] if _within_iso_window(e.get("commence_time", ""), start_iso, end_iso)]
+        # Time filter (week window) if provided; otherwise query all events (safer for coverage)
+        evs = [e for e in (events or []) if _within_iso(e.get("commence_time", ""), start_iso, end_iso)]
+        diag["events_in_window"] = len(evs)
 
-        # Gather odds per event concurrently
-        sem = asyncio.Semaphore(8)  # be nice to rate limits
+        # If windowed set is empty, fall back to all events to maximize chance of props
+        if not evs:
+            evs = events or []
+
+        sem = asyncio.Semaphore(6)
 
         async def fetch_one(ev: dict):
             async with sem:
@@ -104,14 +113,13 @@ async def get_nfl_player_prop_lines(
                     home = ev.get("home_team") or ""
                     away = ev.get("away_team") or ""
                     token_game = f"{_norm(away)}|{_norm(home)}"
-
                     payload = await _event_odds(
-                        client,
-                        ev["id"],
-                        requested_markets,
-                        region=region,
-                        bookmakers=bookmakers,
+                        client, ev["id"], requested_markets, region=region, bookmakers=bookmakers
                     )
+                    diag["queried"] += 1
+
+                    if payload.get("bookmakers"):
+                        diag["events_with_markets"] += 1
 
                     for bk in payload.get("bookmakers") or []:
                         book = bk.get("title") or bk.get("key")
@@ -126,7 +134,6 @@ async def get_nfl_player_prop_lines(
                                 if line is None:
                                     continue
 
-                                # We can’t 100% know team from outcome; attach both home/away variants.
                                 for team_name, opp_name in [(home, away), (away, home)]:
                                     pkey = f"{_norm(player)}|{_norm(team_name)}|{_norm(opp_name)}"
                                     entry = out.setdefault(
@@ -146,9 +153,18 @@ async def get_nfl_player_prop_lines(
                                         entry["markets"][stat] = float(line)
                                         entry["book"] = book
                 except Exception:
-                    # Don't let one event kill the batch
                     return
 
-        await asyncio.gather(*[fetch_one(ev) for ev in events or []])
+        await asyncio.gather(*[fetch_one(ev) for ev in evs])
 
-    return out
+    # include a tiny sample in diagnostics
+    for _, v in out.items():
+        diag["sample"] = {"player": v["player"], "team": v["team"], "markets": v["markets"], "book": v["book"]}
+        break
+
+    if debug:
+        diag["requested_markets"] = requested_markets
+        if bookmakers:
+            diag["bookmakers"] = bookmakers
+
+    return out, diag

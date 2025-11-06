@@ -34,8 +34,10 @@ def _build_game_lookup(events: List[dict]) -> Dict[str, dict]:
 async def nfl_player_props(
     season: Optional[int] = None,
     week: Optional[int] = None,
-    stats: str = Query("recYds,rushYds,passYds,receptions,passTDs", description="Comma list of stats"),
+    stats: str = Query("recYds,receptions,rushYds,passYds,passTDs", description="Comma list of stats"),
     include_markets: bool = True,
+    bookmakers: Optional[str] = Query(None, description="Comma-separated list, e.g. 'draftkings,fanduel'"),
+    debug: bool = False,
 ):
     """
     Returns list of player prop projections (and edges when markets available).
@@ -44,39 +46,42 @@ async def nfl_player_props(
         season, week = current_season_week()
 
     want_stats = [s.strip() for s in stats.split(",") if s.strip()]
-
-    # Get the week’s ISO window and schedule (for opponent/context)
     start_iso, end_iso = week_window(season, week)
     events = await _week_games(season, week)
     games = _build_game_lookup(events)
     logger.info("NFL props: season=%s week=%s games=%d", season, week, len(games))
 
-    market_blob = {}
+    # Markets
+    bks = [b.strip() for b in (bookmakers or "").split(",") if b.strip()] or None
+    market_blob, diag = ({}, {})
     if include_markets:
         try:
-            market_blob = await asyncio.wait_for(
+            market_blob, diag = await asyncio.wait_for(
                 get_nfl_player_prop_lines(
                     season=season,
                     week=week,
                     want_stats=want_stats,
                     start_iso=start_iso,
                     end_iso=end_iso,
+                    bookmakers=bks,
+                    debug=debug,
                 ),
-                timeout=12.0,
+                timeout=15.0,
             )
         except Exception as e:
             logger.exception("odds props fetch failed: %s", e)
             market_blob = {}
+            diag = {"error": "fetch_failed"}
 
     rows: List[dict] = []
 
+    # If odds returned nothing, you still get model-only projections when markets are absent (edges empty)
     for pkey, entry in (market_blob or {}).items():
         team = entry["team"]
         opp = entry["opponent"]
         token = entry.get("gameToken")
-        g = games.get(token)
 
-        # Use neutral anchors when we don't have a modeled FG line handy
+        # neutral anchors for now (no DB)
         game_total = 43.0
         team_spread_home = 0.0
 
@@ -88,18 +93,16 @@ async def nfl_player_props(
             game_total=game_total,
             team_spread_home=team_spread_home,
         )
-
         proj_filt = {k: v for k, v in proj.items() if k in want_stats}
 
         market = {}
         edges = {}
-        if include_markets:
-            for stat in want_stats:
-                ml = entry["markets"].get(stat)
-                if ml is not None:
-                    market[stat] = ml
-                    if stat in proj_filt:
-                        edges[stat] = round(proj_filt[stat] - ml, 2)
+        for stat in want_stats:
+            ml = (entry.get("markets") or {}).get(stat)
+            if ml is not None:
+                market[stat] = ml
+                if stat in proj_filt:
+                    edges[stat] = round(proj_filt[stat] - ml, 2)
 
         rows.append({
             "player": entry["player"],
@@ -107,15 +110,16 @@ async def nfl_player_props(
             "opponent": opp,
             "position": entry.get("position"),
             "model": proj_filt,
-            "market": {"book": entry.get("book"), **market} if market else {},
-            "edge": edges if edges else {},
+            "market": ({"book": entry.get("book"), **market} if market else {}),
+            "edge": (edges if edges else {}),
         })
 
     return {
         "season": season,
         "week": week,
         "rows": rows,
-        "note": "Player props pulled per-event via Odds API; projections are baseline-paced.",
+        "diagnostics": diag if debug else None,
+        "note": "If rows=[], your plan/bookmaker coverage may not include props for this week. Try ?bookmakers=draftkings or remove bookmaker filter.",
     }
 
 
@@ -125,8 +129,17 @@ async def nfl_player_props_edges(
     week: Optional[int] = None,
     stat: str = Query("recYds", description="recYds | rushYds | passYds | receptions | passTDs"),
     limit: int = 25,
+    bookmakers: Optional[str] = Query(None, description="Comma-separated (optional)"),
+    debug: bool = False,
 ):
-    data = await nfl_player_props(season=season, week=week, stats=stat, include_markets=True)
+    data = await nfl_player_props(
+        season=season,
+        week=week,
+        stats=stat,
+        include_markets=True,
+        bookmakers=bookmakers,
+        debug=debug,
+    )
     rows = data.get("rows", [])
 
     def _edge_abs(r):
@@ -139,4 +152,5 @@ async def nfl_player_props_edges(
         "week": data.get("week"),
         "stat": stat,
         "rows": ranked[:max(1, min(limit, 100))],
+        "diagnostics": data.get("diagnostics") if debug else None,
     }
