@@ -94,6 +94,7 @@ async def nfl_slate(
     scope: str = Query("FG", pattern="^FG$"),
     include_markets: bool = False,
 ):
+    # IMPORTANT: NFL only supports FG scope
     if scope != "FG":
         raise HTTPException(400, "NFL supports FG scope only")
 
