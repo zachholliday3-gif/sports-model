@@ -1,16 +1,19 @@
 # app/routers/cbb_routes.py
-from fastapi import APIRouter, HTTPException, Query
-from typing import Optional, List
+from __future__ import annotations
+
 import asyncio
 import logging
+from typing import List, Optional
 
+from fastapi import APIRouter, HTTPException, Query
+
+from app.models.cbb_model import project_cbb_1h
+from app.models.cbb_types import GameLite, MatchupDetail, Projection
 from app.services.espn_cbb import (
-    get_games_for_date,
     extract_game_lite,
     extract_matchup_detail,
+    get_games_for_date,
 )
-from app.models.cbb_model import project_cbb_1h
-from app.models.cbb_types import GameLite, Projection, MatchupDetail
 from app.services.odds_api import get_cbb_1h_lines  # shared odds service
 
 logger = logging.getLogger("app.cbb")
@@ -19,11 +22,13 @@ router = APIRouter(tags=["cbb"])
 def _norm(s: str) -> str:
     return "".join(ch for ch in (s or "").lower() if ch.isalnum())
 
+
 # -------- Schedule --------
 @router.get("/schedule", response_model=List[GameLite])
 async def cbb_schedule(date: Optional[str] = None):
     """
     CBB schedule by date (YYYYMMDD). Defaults to US/Eastern 'today' if missing.
+    Falls back to adjacent dates if ESPN posts near ET midnight.
     """
     try:
         games = await get_games_for_date(date)
@@ -35,6 +40,7 @@ async def cbb_schedule(date: Optional[str] = None):
     rows = [extract_game_lite(ev) for ev in games]
     logger.info("CBB schedule: date=%s -> %d", date, len(rows))
     return rows
+
 
 # -------- Slate (1H/FG projections) --------
 @router.get("/slate")
@@ -55,7 +61,6 @@ async def cbb_slate(
     markets = {}
     if include_markets:
         try:
-            # using FG lines as proxy unless your plan supports 1H markets
             markets = await asyncio.wait_for(get_cbb_1h_lines(), timeout=8.0)
             logger.info("CBB markets loaded: %d", len(markets))
         except Exception as e:
@@ -71,7 +76,7 @@ async def cbb_slate(
         if scope == "1H":
             m = m1h
         else:
-            # simple FG proxy from 1H — refine later
+            # simple FG proxy from 1H — refine later as you like
             m = {
                 "projTotal": round(m1h["projTotal"] * 2.02, 1),
                 "projSpreadHome": round(m1h["projSpreadHome"] * 2.0, 1),
@@ -93,6 +98,7 @@ async def cbb_slate(
         })
     return rows
 
+
 # -------- Edges (ranked) --------
 @router.get("/edges")
 async def cbb_edges(
@@ -111,6 +117,7 @@ async def cbb_edges(
     ranked = sorted(rows, key=_abs_edge, reverse=True)
     return ranked[:max(1, min(limit, 100))]
 
+
 # -------- Projections alias (for GPT intent) --------
 @router.get("/projections")
 async def cbb_projections_api(
@@ -119,6 +126,7 @@ async def cbb_projections_api(
     include_markets: bool = False,
 ):
     return await cbb_slate(date=date, scope=scope, include_markets=include_markets)
+
 
 # -------- Single matchup (optional) --------
 @router.get("/matchups/{gameId}", response_model=MatchupDetail)

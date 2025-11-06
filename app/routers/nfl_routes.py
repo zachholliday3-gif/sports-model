@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -16,14 +17,34 @@ from app.services.espn_nfl import (
 from app.services.nfl_weeks import current_season_week, week_window
 from app.services.odds_api import get_nfl_fg_lines  # shared odds service
 
-# --------------------------------------------------------------------
-# Router + logger MUST be defined before any @router.get decorators
-# --------------------------------------------------------------------
 logger = logging.getLogger("app.nfl")
 router = APIRouter(tags=["nfl"])
 
 def _norm(s: str) -> str:
     return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+
+async def _fetch_week_games(season: int, week: int) -> list:
+    """
+    Fetch games for week window; if zero games, widen the window by +/- 3 days
+    to capture TNF/SNF/MNF or odd week definitions. Returns a list of ESPN events.
+    """
+    start, end = week_window(season, week)
+    try:
+        games = await get_games_for_range(start, end)
+    except Exception:
+        games = []
+
+    if games:
+        return games
+
+    # Auto-widen: +/- 3 days
+    logger.info("NFL fallback widen window for season=%s week=%s", season, week)
+    try:
+        games = await get_games_for_range(start - timedelta(days=3), end + timedelta(days=3))
+    except Exception:
+        games = []
+    return games
 
 
 # ---------------- Schedule (week-based) ----------------
@@ -37,11 +58,10 @@ async def nfl_schedule(
     """
     try:
         if season and week:
-            start, end = week_window(season, week)
+            games = await _fetch_week_games(season, week)
         else:
             season, week = current_season_week()
-            start, end = week_window(season, week)
-        games = await get_games_for_range(start, end)
+            games = await _fetch_week_games(season, week)
     except Exception as e:
         logger.exception("nfl schedule failed: season=%s week=%s err=%s", season, week, e)
         return []
@@ -63,11 +83,10 @@ async def nfl_slate(
 
     try:
         if season and week:
-            start, end = week_window(season, week)
+            games = await _fetch_week_games(season, week)
         else:
             season, week = current_season_week()
-            start, end = week_window(season, week)
-        games = await get_games_for_range(start, end)
+            games = await _fetch_week_games(season, week)
     except Exception as e:
         logger.exception("nfl slate failed: season=%s week=%s err=%s", season, week, e)
         return []
@@ -126,11 +145,7 @@ async def nfl_edges(
 @router.get("/this_week")
 async def nfl_this_week(include_markets: bool = False):
     season, week = current_season_week()
-    start, end = week_window(season, week)
-    try:
-        games = await get_games_for_range(start, end)
-    except Exception:
-        games = []
+    games = await _fetch_week_games(season, week)
     rows = []
     for ev in games:
         lite = extract_game_lite(ev)
@@ -139,7 +154,7 @@ async def nfl_this_week(include_markets: bool = False):
             **lite,
             "model": {"scope": "FG", **m},
         })
-    return {"season": season, "week": week, "start": start, "end": end, "rows": rows}
+    return {"season": season, "week": week, "start": None, "end": None, "rows": rows}
 
 
 @router.get("/week")
@@ -149,14 +164,10 @@ async def nfl_week_slate(
     include_markets: bool = False,
 ):
     """
-    Returns {season, week, start, end, rows:[...]} built from the computed week window.
+    Returns {season, week, rows:[...]} built from the computed week window,
+    with an automatic widened-window fallback if ESPN returned 0 games.
     """
-    start, end = week_window(season, week)
-    try:
-        games = await get_games_for_range(start, end)
-    except Exception as e:
-        logger.exception("nfl week(%s,%s) fetch failed: %s", season, week, e)
-        games = []
+    games = await _fetch_week_games(season, week)
 
     logger.info("NFL week slate: season=%s week=%s include_markets=%s", season, week, include_markets)
     logger.info("NFL games fetched: %d", len(games))
@@ -190,7 +201,7 @@ async def nfl_week_slate(
             "edge": {"total": edge_total, "spreadHome": edge_spread},
         })
 
-    return {"season": season, "week": week, "start": start, "end": end, "rows": rows}
+    return {"season": season, "week": week, "rows": rows}
 
 
 # ---------------- Projections alias (GPT-friendly) ----------------
