@@ -1,151 +1,128 @@
 # app/services/espn_cbb.py
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
-
 import httpx
-from zoneinfo import ZoneInfo
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+import logging
 
-NY = ZoneInfo("America/New_York")
+logger = logging.getLogger("app.espn_cbb")
+
+# ESPN "site" scoreboard base for Men's college basketball
+SITE_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard"
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
-# Primary + fallback base URLs (ESPN sometimes moves the working host)
-BASE_URLS = [
-    "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard",
-    "https://site.web.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard",
-]
+
+def _ny_today_yyyymmdd() -> str:
+    """Treat 'today' as America/New_York (project convention: UTC-5 fallback)."""
+    ny_now = datetime.now(timezone.utc) - timedelta(hours=5)
+    return ny_now.strftime("%Y%m%d")
 
 
-def _today_yyyymmdd() -> str:
-    return datetime.now(NY).strftime("%Y%m%d")
-
-
-def _coerce_yyyymmdd(date_str: Optional[str]) -> str:
-    """
-    Accepts:
-      - None -> today (US/Eastern)
-      - 'YYYYMMDD' -> returns as-is if valid
-      - 'YYYY-MM-DD' -> converts to 'YYYYMMDD'
-    Raises ValueError on other inputs.
-    """
-    if not date_str:
-        return _today_yyyymmdd()
-    ds = date_str.strip()
-    if len(ds) == 10 and ds[4] == "-" and ds[7] == "-":
-        dt = datetime.strptime(ds, "%Y-%m-%d")
-        return dt.strftime("%Y%m%d")
-    if len(ds) == 8 and ds.isdigit():
-        return ds
-    raise ValueError("date must be YYYYMMDD (or YYYY-MM-DD)")
-
-
-async def _get_json(url: str, params: Dict[str, Any]) -> Any:
+async def _get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Tiny retry wrapper."""
+    last = None
     async with httpx.AsyncClient(timeout=12.0, headers=HEADERS) as client:
-        last = None
-        for i in range(2):
+        for attempt in range(2):
             try:
                 r = await client.get(url, params=params)
                 r.raise_for_status()
                 return r.json()
             except Exception as e:
                 last = e
-                await asyncio.sleep(0.35 * (i + 1))
-        raise last or RuntimeError("unknown http error")
+                logger.warning("espn_cbb _get_json attempt %d failed: %s", attempt + 1, e)
+    raise last or RuntimeError("unknown http error")
 
 
-async def _try_variants(date_str: str) -> List[Dict[str, Any]]:
+def _scoreboard_params_for_date(date_yyyymmdd: str, d1_only: bool) -> Dict[str, Any]:
     """
-    Try multiple host/param combinations that ESPN accepts for CBB:
-      - dates=YYYYMMDD
-      - dates=YYYYMMDD-YYYYMMDD
-      - with/without groups=50 (Division I)
-    Returns first non-empty events list found; otherwise [].
+    ESPN accepts a dates range like 20251107-20251107; limit is generous.
+    Division I filter = groups=50 (same as ESPN UI 'Division I').
     """
-    candidates: List[tuple[str, Dict[str, Any]]] = []
-    # Param shapes
-    single = {"dates": date_str, "limit": 500}
-    single_g = {"dates": date_str, "groups": 50, "limit": 500}
-    rng = {"dates": f"{date_str}-{date_str}", "limit": 500}
-    rng_g = {"dates": f"{date_str}-{date_str}", "groups": 50, "limit": 500}
-
-    for base in BASE_URLS:
-        candidates.append((base, single))
-        candidates.append((base, single_g))
-        candidates.append((base, rng))
-        candidates.append((base, rng_g))
-
-    for url, params in candidates:
-        try:
-            data = await _get_json(url, params)
-            events = data.get("events") or []
-            if isinstance(events, list) and events:
-                return events
-        except Exception:
-            # try next variant
-            continue
-
-    return []
+    params: Dict[str, Any] = {
+        "dates": f"{date_yyyymmdd}-{date_yyyymmdd}",
+        "limit": 500,
+    }
+    if d1_only:
+        params["groups"] = 50
+    return params
 
 
-async def get_games_for_date(date: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Loads CBB games for a given date using robust ESPN variants.
-    If no events are returned (midnight posting windows), also try (date-1) and (date+1).
-    """
-    d = _coerce_yyyymmdd(date)
-
-    # primary attempts
-    events = await _try_variants(d)
-    if events:
-        return events
-
-    # soft fallback around midnight ET
-    dt = datetime.strptime(d, "%Y%m%d")
-    for delta in (-1, 1):
-        alt = (dt + timedelta(days=delta)).strftime("%Y%m%d")
-        evs = await _try_variants(alt)
-        if evs:
-            return evs
-
-    # truly no data
-    return []
-
-
-def _team_name(comp: Dict[str, Any]) -> str:
-    team = (comp or {}).get("team") or {}
-    return team.get("displayName") or team.get("location") or team.get("name") or "Unknown"
-
-
-def extract_game_lite(ev: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize an ESPN event -> lite row used by routers.
-    """
-    game_id = ev.get("id") or ""
-    date = ev.get("date")  # ISO timestamp
-    comps = (ev.get("competitions") or [{}])
-    comp = comps[0] if comps else {}
-    competitors = comp.get("competitors") or []
-
-    home_name, away_name = "Home", "Away"
-    for c in competitors:
-        if (c.get("homeAway") or "").lower() == "home":
-            home_name = _team_name(c)
-        elif (c.get("homeAway") or "").lower() == "away":
-            away_name = _team_name(c)
-
+def extract_game_lite(event: Dict[str, Any]) -> Dict[str, Any]:
+    comp = (event.get("competitions") or [{}])[0]
+    comps = comp.get("competitors") or []
+    home_name = away_name = None
+    for c in comps:
+        side = (c.get("homeAway") or "").lower()
+        t = c.get("team") or {}
+        nm = t.get("displayName") or t.get("name")
+        if side == "home":
+            home_name = nm
+        elif side == "away":
+            away_name = nm
     return {
-        "gameId": str(game_id),
-        "startTime": date,
+        "gameId": event.get("id"),
         "homeTeam": home_name,
         "awayTeam": away_name,
+        "startTime": comp.get("date"),
     }
 
 
-def extract_matchup_detail(ev: Dict[str, Any]) -> Dict[str, Any]:
+def extract_matchup_detail(event: Dict[str, Any]) -> Dict[str, Any]:
+    lite = extract_game_lite(event)
+    return {
+        "gameId": lite["gameId"],
+        "homeTeam": lite["homeTeam"],
+        "awayTeam": lite["awayTeam"],
+        "startTime": lite["startTime"],
+        "notes": None,
+    }
+
+
+async def get_games_for_date(date: Optional[str] = None, d1_only: bool = True) -> List[Dict[str, Any]]:
     """
-    Detailed single matchup model shell (expand later as needed).
+    Load ESPN CBB scoreboard for a single date.
+    - date: 'YYYYMMDD' or None (today in NY)
+    - d1_only: True -> adds 'groups=50' to return NCAA Division I only
     """
-    lite = extract_game_lite(ev)
-    return {**lite, "notes": None}
+    d = (date or _ny_today_yyyymmdd()).strip()
+    params = _scoreboard_params_for_date(d, d1_only=d1_only)
+    logger.info("CBB get_games_for_date date=%s d1_only=%s params=%s", d, d1_only, params)
+
+    data = await _get_json(SITE_BASE, params)
+    events = data.get("events") or []
+    logger.info("CBB get_games_for_date returned %d events", len(events))
+    return events
+
+
+# ---------- Optional: Top-25 helpers (safe to keep if you added Top-25 route) ----------
+from typing import Optional as _Optional
+
+def _team_rank(team: dict) -> _Optional[int]:
+    try:
+        r = (team.get("curatedRank") or {}).get("current", None)
+        if r is None:
+            r = team.get("rank", None)
+        return int(r) if r is not None else None
+    except Exception:
+        return None
+
+def _event_has_top25(event: dict, only_unranked_opponent: bool = False) -> bool:
+    comps = (((event or {}).get("competitions") or [{}])[0].get("competitors")) or []
+    ranks = []
+    for c in comps:
+        team = (c or {}).get("team") or {}
+        ranks.append(_team_rank(team))
+    if not ranks:
+        return False
+    top25_count = sum(1 for r in ranks if (r is not None and r <= 25))
+    if top25_count == 0:
+        return False
+    if not only_unranked_opponent:
+        return True
+    return top25_count == 1
+
+async def get_top25_for_date(date: _Optional[str] = None, only_unranked_opponent: bool = False, d1_only: bool = True) -> list[dict]:
+    events = await get_games_for_date(date, d1_only=d1_only)
+    return [ev for ev in events if _event_has_top25(ev, only_unranked_opponent)]
+# --------------------------------------------------------------------------------------
