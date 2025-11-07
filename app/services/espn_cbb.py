@@ -22,20 +22,16 @@ def _ny_today_yyyymmdd() -> str:
 
 def _yyyymmdd(date_str: Optional[str]) -> str:
     """
-    Normalize incoming date:
-      - Accepts YYYYMMDD, YYYY-MM-DD, or ISO-ish strings.
-      - Returns strictly digits 'YYYYMMDD'.
-    Falls back to 'today' (NY) if parsing fails.
+    Normalize incoming date to strictly 'YYYYMMDD'.
+    Accepts YYYYMMDD, YYYY-MM-DD, or ISO-like values; falls back to NY 'today'.
     """
     if not date_str:
         return _ny_today_yyyymmdd()
 
-    # Keep only digits; if 8 digits, assume YYYYMMDD
     digits = re.sub(r"\D", "", date_str)
     if len(digits) == 8:
         return digits
 
-    # Try robust parse as a fallback
     try:
         dt = datetime.fromisoformat(date_str[:10])
         return dt.strftime("%Y%m%d")
@@ -62,16 +58,12 @@ async def _get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
 def _site_params(date_yyyymmdd: str, d1_only: bool, add_range: bool = False) -> Dict[str, Any]:
     """
     Build ESPN site params.
-    We prefer a single-day 'dates=YYYYMMDD' (more tolerant).
-    If add_range=True, use 'YYYYMMDD-YYYYMMDD' (older behavior).
+    Prefer single-day 'dates=YYYYMMDD'; fall back to range if we must.
     """
     dates_val = f"{date_yyyymmdd}-{date_yyyymmdd}" if add_range else date_yyyymmdd
-    params: Dict[str, Any] = {
-        "dates": dates_val,
-        "limit": 500,
-    }
+    params: Dict[str, Any] = {"dates": dates_val, "limit": 500}
     if d1_only:
-        params["groups"] = 50  # Division I filter
+        params["groups"] = 50  # Division I filter (matches ESPN UI)
     return params
 
 
@@ -139,13 +131,20 @@ async def get_games_for_date(date: Optional[str] = None, d1_only: bool = True) -
     """
     Load ESPN CBB scoreboard for a single date.
     - date: 'YYYYMMDD' or 'YYYY-MM-DD' or None (today in NY)
-    - d1_only: True -> adds 'groups=50' to request NCAA Division I only (falls back without if ESPN 400s)
+    - d1_only: True -> request NCAA Division I only (groups=50).
+               If no D1 events found, we auto-fallback to ALL levels for that date.
     """
     d = _yyyymmdd(date)
     logger.info("CBB get_games_for_date date=%s d1_only=%s", d, d1_only)
 
+    # First try (with current d1_only setting)
     data = await _fetch_site(d, d1_only=d1_only)
     events = data.get("events") or []
+    if d1_only and len(events) == 0:
+        logger.info("CBB get_games_for_date: D1 returned 0 events for %s — auto-fallback to ALL levels", d)
+        data2 = await _fetch_site(d, d1_only=False)
+        events = data2.get("events") or []
+
     logger.info("CBB get_games_for_date returned %d events", len(events))
     return events
 
