@@ -5,6 +5,7 @@ import httpx
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
 import logging
+import re
 
 logger = logging.getLogger("app.espn_cbb")
 
@@ -17,6 +18,30 @@ def _ny_today_yyyymmdd() -> str:
     """Treat 'today' as America/New_York (project convention: UTC-5 fallback)."""
     ny_now = datetime.now(timezone.utc) - timedelta(hours=5)
     return ny_now.strftime("%Y%m%d")
+
+
+def _yyyymmdd(date_str: Optional[str]) -> str:
+    """
+    Normalize incoming date:
+      - Accepts YYYYMMDD, YYYY-MM-DD, or ISO-ish strings.
+      - Returns strictly digits 'YYYYMMDD'.
+    Falls back to 'today' (NY) if parsing fails.
+    """
+    if not date_str:
+        return _ny_today_yyyymmdd()
+
+    # Keep only digits; if 8 digits, assume YYYYMMDD
+    digits = re.sub(r"\D", "", date_str)
+    if len(digits) == 8:
+        return digits
+
+    # Try robust parse as a fallback
+    try:
+        dt = datetime.fromisoformat(date_str[:10])
+        return dt.strftime("%Y%m%d")
+    except Exception:
+        logger.warning("espn_cbb: could not parse date '%s', falling back to NY today", date_str)
+        return _ny_today_yyyymmdd()
 
 
 async def _get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -34,18 +59,49 @@ async def _get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
     raise last or RuntimeError("unknown http error")
 
 
-def _scoreboard_params_for_date(date_yyyymmdd: str, d1_only: bool) -> Dict[str, Any]:
+def _site_params(date_yyyymmdd: str, d1_only: bool, add_range: bool = False) -> Dict[str, Any]:
     """
-    ESPN accepts a dates range like 20251107-20251107; limit is generous.
-    Division I filter = groups=50 (same as ESPN UI 'Division I').
+    Build ESPN site params.
+    We prefer a single-day 'dates=YYYYMMDD' (more tolerant).
+    If add_range=True, use 'YYYYMMDD-YYYYMMDD' (older behavior).
     """
+    dates_val = f"{date_yyyymmdd}-{date_yyyymmdd}" if add_range else date_yyyymmdd
     params: Dict[str, Any] = {
-        "dates": f"{date_yyyymmdd}-{date_yyyymmdd}",
+        "dates": dates_val,
         "limit": 500,
     }
     if d1_only:
-        params["groups"] = 50
+        params["groups"] = 50  # Division I filter
     return params
+
+
+async def _fetch_site(date_yyyymmdd: str, d1_only: bool) -> Dict[str, Any]:
+    """
+    Try single-day + groups first; on 400, retry without groups; then try range.
+    """
+    # 1) single-day with groups (if any)
+    params = _site_params(date_yyyymmdd, d1_only=d1_only, add_range=False)
+    try:
+        return await _get_json(SITE_BASE, params)
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 400:
+            logger.info("espn_cbb: retrying without groups for date=%s", date_yyyymmdd)
+            # 2) single-day without groups
+            params2 = _site_params(date_yyyymmdd, d1_only=False, add_range=False)
+            try:
+                return await _get_json(SITE_BASE, params2)
+            except httpx.HTTPStatusError as e2:
+                if e2.response is not None and e2.response.status_code == 400:
+                    logger.info("espn_cbb: retrying with range format for date=%s", date_yyyymmdd)
+                    # 3) range with/without groups as last resort
+                    params3 = _site_params(date_yyyymmdd, d1_only=d1_only, add_range=True)
+                    try:
+                        return await _get_json(SITE_BASE, params3)
+                    except Exception:
+                        params4 = _site_params(date_yyyymmdd, d1_only=False, add_range=True)
+                        return await _get_json(SITE_BASE, params4)
+                raise
+        raise
 
 
 def extract_game_lite(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -82,20 +138,19 @@ def extract_matchup_detail(event: Dict[str, Any]) -> Dict[str, Any]:
 async def get_games_for_date(date: Optional[str] = None, d1_only: bool = True) -> List[Dict[str, Any]]:
     """
     Load ESPN CBB scoreboard for a single date.
-    - date: 'YYYYMMDD' or None (today in NY)
-    - d1_only: True -> adds 'groups=50' to return NCAA Division I only
+    - date: 'YYYYMMDD' or 'YYYY-MM-DD' or None (today in NY)
+    - d1_only: True -> adds 'groups=50' to request NCAA Division I only (falls back without if ESPN 400s)
     """
-    d = (date or _ny_today_yyyymmdd()).strip()
-    params = _scoreboard_params_for_date(d, d1_only=d1_only)
-    logger.info("CBB get_games_for_date date=%s d1_only=%s params=%s", d, d1_only, params)
+    d = _yyyymmdd(date)
+    logger.info("CBB get_games_for_date date=%s d1_only=%s", d, d1_only)
 
-    data = await _get_json(SITE_BASE, params)
+    data = await _fetch_site(d, d1_only=d1_only)
     events = data.get("events") or []
     logger.info("CBB get_games_for_date returned %d events", len(events))
     return events
 
 
-# ---------- Optional: Top-25 helpers (safe to keep if you added Top-25 route) ----------
+# ---------- Optional: Top-25 helpers ----------
 from typing import Optional as _Optional
 
 def _team_rank(team: dict) -> _Optional[int]:
@@ -125,4 +180,4 @@ def _event_has_top25(event: dict, only_unranked_opponent: bool = False) -> bool:
 async def get_top25_for_date(date: _Optional[str] = None, only_unranked_opponent: bool = False, d1_only: bool = True) -> list[dict]:
     events = await get_games_for_date(date, d1_only=d1_only)
     return [ev for ev in events if _event_has_top25(ev, only_unranked_opponent)]
-# --------------------------------------------------------------------------------------
+# ---------------------------------------------
