@@ -1,168 +1,140 @@
 # app/routers/cbb_routes.py
 from __future__ import annotations
 
-import asyncio
 import logging
-from datetime import datetime, timedelta
 from typing import List, Optional
-
 from fastapi import APIRouter, HTTPException, Query
 
-from app.models.cbb_model import project_cbb_1h
-from app.models.cbb_types import GameLite, MatchupDetail, Projection
+from app.models.cbb_types import GameLite, Projection, MatchupDetail
 from app.services.espn_cbb import (
+    get_games_for_date,
     extract_game_lite,
     extract_matchup_detail,
-    get_games_for_date,
 )
-from app.services.odds_api import get_cbb_1h_lines  # shared odds service
+from app.models.cbb_model import project_cbb_1h
 
 logger = logging.getLogger("app.cbb")
-router = APIRouter(tags=["cbb"])
-
-def _norm(s: str) -> str:
-    return "".join(ch for ch in (s or "").lower() if ch.isalnum())
-
-def _resolve_when_to_date(when: Optional[str]) -> Optional[str]:
-    """
-    Maps 'today'/'tomorrow'/'yesterday' or 'date:YYYYMMDD' -> 'YYYYMMDD'.
-    Returns None to indicate 'today' by default (handled in service).
-    """
-    if not when:
-        return None
-    w = when.strip().lower()
-    now = datetime.now().astimezone()
-    if w == "today":
-        return now.strftime("%Y%m%d")
-    if w == "tomorrow":
-        return (now + timedelta(days=1)).strftime("%Y%m%d")
-    if w == "yesterday":
-        return (now - timedelta(days=1)).strftime("%Y%m%d")
-    if w.startswith("date:"):
-        ds = w.split(":", 1)[1].strip()
-        # accept YYYYMMDD or YYYY-MM-DD
-        if len(ds) == 10 and ds[4] == "-" and ds[7] == "-":
-            try:
-                return datetime.strptime(ds, "%Y-%m-%d").strftime("%Y%m%d")
-            except Exception:
-                return None
-        if len(ds) == 8 and ds.isdigit():
-            return ds
-    return None
+router = APIRouter(tags=["CBB"])
 
 
-# -------- Schedule --------
+# -------------------------
+# 🏀  CBB — Schedule
+# -------------------------
 @router.get("/schedule", response_model=List[GameLite])
-async def cbb_schedule(date: Optional[str] = None):
+async def cbb_schedule(
+    date: Optional[str] = None,
+    d1_only: bool = Query(
+        True, description="If true, only NCAA Division I games (ESPN groups = 50)"
+    ),
+):
     """
-    CBB schedule by date (YYYYMMDD). Defaults to US/Eastern 'today' if missing.
-    Falls back to adjacent dates if ESPN posts near ET midnight.
+    Returns ESPN CBB schedule for a date (defaults to Division I only).
     """
     try:
-        games = await get_games_for_date(date)
+        games = await get_games_for_date(date, d1_only=d1_only)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.exception("cbb schedule failed for date=%s: %s", date, e)
+        logger.exception("schedule failed for date=%s: %s", date, e)
         return []
-    rows = [extract_game_lite(ev) for ev in games]
-    logger.info("CBB schedule: date=%s -> %d", date, len(rows))
-    return rows
+    return [extract_game_lite(ev) for ev in games]
 
 
-# -------- Slate (1H/FG projections) --------
+# -------------------------
+# 🧮  CBB — Projections
+# -------------------------
+@router.get("/projections", response_model=List[Projection])
+async def cbb_projections(
+    date: Optional[str] = None,
+    scope: str = Query("1H", pattern="^(1H|FG)$"),
+    d1_only: bool = Query(
+        True, description="If true, only NCAA Division I games (ESPN groups = 50)"
+    ),
+):
+    """
+    Returns projections for a date (scope: 1H or FG).
+    Defaults to Division I only.
+    """
+    if scope not in ("1H", "FG"):
+        raise HTTPException(400, "scope must be '1H' or 'FG'")
+
+    try:
+        games = await get_games_for_date(date, d1_only=d1_only)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("projections failed for date=%s: %s", date, e)
+        return []
+
+    projections: List[Projection] = []
+    for ev in games:
+        lite = extract_game_lite(ev)
+
+        if scope == "1H":
+            model = project_cbb_1h(lite["homeTeam"], lite["awayTeam"])
+        else:
+            base = project_cbb_1h(lite["homeTeam"], lite["awayTeam"])
+            model = {
+                "projTotal": round(base["projTotal"] * 2.02, 1),
+                "projSpreadHome": round(base["projSpreadHome"] * 2.0, 1),
+                "confidence": base["confidence"],
+            }
+
+        projections.append({"gameId": lite["gameId"], "scope": scope, **model})
+    return projections
+
+
+# -------------------------
+# 🗓️  CBB — Slate (Schedule + Model)
+# -------------------------
 @router.get("/slate")
 async def cbb_slate(
     date: Optional[str] = None,
     scope: str = Query("1H", pattern="^(1H|FG)$"),
-    include_markets: bool = False,  # default safe/fast
+    d1_only: bool = Query(
+        True, description="If true, only NCAA Division I games (ESPN groups = 50)"
+    ),
 ):
+    """
+    Returns schedule rows with model projections (defaults to Division I only).
+    """
     try:
-        games = await get_games_for_date(date)
+        games = await get_games_for_date(date, d1_only=d1_only)
     except Exception as e:
-        logger.exception("cbb slate failed for date=%s: %s", date, e)
+        logger.exception("slate failed for date=%s: %s", date, e)
         return []
 
-    logger.info("CBB slate params: date=%s scope=%s include_markets=%s", date, scope, include_markets)
-    logger.info("CBB games fetched: %d", len(games))
-
-    markets = {}
-    if include_markets:
-        try:
-            markets = await asyncio.wait_for(get_cbb_1h_lines(), timeout=8.0)
-            logger.info("CBB markets loaded: %d", len(markets))
-        except Exception as e:
-            logger.exception("cbb odds fetch failed or timed out: %s", e)
-            markets = {}
-
-    rows = []
+    slate_rows = []
     for ev in games:
         lite = extract_game_lite(ev)
 
-        # base model (1H)
-        m1h = project_cbb_1h(lite["homeTeam"], lite["awayTeam"])
         if scope == "1H":
-            m = m1h
+            model = project_cbb_1h(lite["homeTeam"], lite["awayTeam"])
         else:
-            # simple FG proxy from 1H — refine later as you like
-            m = {
-                "projTotal": round(m1h["projTotal"] * 2.02, 1),
-                "projSpreadHome": round(m1h["projSpreadHome"] * 2.0, 1),
-                "confidence": m1h["confidence"],
+            base = project_cbb_1h(lite["homeTeam"], lite["awayTeam"])
+            model = {
+                "projTotal": round(base["projTotal"] * 2.02, 1),
+                "projSpreadHome": round(base["projSpreadHome"] * 2.0, 1),
+                "confidence": base["confidence"],
             }
 
-        token = f"{_norm(lite['awayTeam'])}|{_norm(lite['homeTeam'])}"
-        mk = markets.get(token, {}) if include_markets else {}
-        mt = mk.get("marketTotal")
-        ms = mk.get("marketSpreadHome")
-        edge_total = round(m["projTotal"] - mt, 2) if isinstance(mt, (int, float)) else None
-        edge_spread = round(m["projSpreadHome"] - ms, 2) if isinstance(ms, (int, float)) else None
+        slate_rows.append({**lite, "model": {"scope": scope, **model}})
 
-        rows.append({
-            **lite,
-            "model": {"scope": scope, **m},
-            "market": {"total": mt, "spreadHome": ms, "book": mk.get("book")},
-            "edge": {"total": edge_total, "spreadHome": edge_spread},
-        })
-    return rows
+    return slate_rows
 
 
-# -------- Edges (ranked) --------
-@router.get("/edges")
-async def cbb_edges(
-    date: Optional[str] = None,
-    scope: str = Query("1H", pattern="^(1H|FG)$"),
-    sort: str = Query("spread", pattern="^(spread|total)$"),
-    limit: int = 25,
-):
-    rows = await cbb_slate(date=date, scope=scope, include_markets=True)
-    key = "spreadHome" if sort == "spread" else "total"
-
-    def _abs_edge(row):
-        val = (row.get("edge") or {}).get(key)
-        return abs(val) if isinstance(val, (int, float)) else -1.0
-
-    ranked = sorted(rows, key=_abs_edge, reverse=True)
-    return ranked[:max(1, min(limit, 100))]
-
-
-# -------- Projections alias (legacy) --------
-@router.get("/projections")
-async def cbb_projections_api(
-    date: Optional[str] = None,
-    scope: str = Query("1H", pattern="^(1H|FG)$"),
-    include_markets: bool = False,
-):
-    return await cbb_slate(date=date, scope=scope, include_markets=include_markets)
-
-
-# -------- Single matchup --------
+# -------------------------
+# 🏀  CBB — Single Matchup (optional endpoint)
+# -------------------------
 @router.get("/matchups/{gameId}", response_model=MatchupDetail)
 async def cbb_matchup(gameId: str, scope: str = "1H"):
+    """
+    Returns matchup detail + model numbers for one game.
+    """
     try:
         games = await get_games_for_date()
     except Exception as e:
-        logger.exception("cbb matchup list failed: %s", e)
+        logger.exception("matchup failed for gameId=%s: %s", gameId, e)
         raise HTTPException(404, "Could not load matchups")
 
     ev = next((g for g in games if g.get("id") == gameId), None)
@@ -171,53 +143,18 @@ async def cbb_matchup(gameId: str, scope: str = "1H"):
 
     base = extract_matchup_detail(ev)
 
-    m1h = project_cbb_1h(base["homeTeam"], base["awayTeam"])
     if scope == "1H":
-        model = m1h
+        model = project_cbb_1h(base["homeTeam"], base["awayTeam"])
     else:
+        base_m = project_cbb_1h(base["homeTeam"], base["awayTeam"])
         model = {
-            "projTotal": round(m1h["projTotal"] * 2.02, 1),
-            "projSpreadHome": round(m1h["projSpreadHome"] * 2.0, 1),
-            "confidence": m1h["confidence"],
+            "projTotal": round(base_m["projTotal"] * 2.02, 1),
+            "projSpreadHome": round(base_m["projSpreadHome"] * 2.0, 1),
+            "confidence": base_m["confidence"],
         }
 
-    return {**base, "notes": None, "model": {"gameId": base["gameId"], "scope": scope, **model}}
-
-
-# -------- GPT-friendly SIMPLE endpoints --------
-@router.get("/projections_simple")
-async def cbb_projections_simple(
-    when: Optional[str] = None,
-    date: Optional[str] = None,
-    scope: str = Query("1H", pattern="^(1H|FG)$"),
-    include_markets: bool = False,
-):
-    """
-    One-call CBB projections for GPT.
-    Use 'when' = today|tomorrow|yesterday|date:YYYYMMDD (date param also supported).
-    """
-    resolved = _resolve_when_to_date(when) or date
-    return await cbb_slate(date=resolved, scope=scope, include_markets=include_markets)
-
-
-@router.get("/edges_simple")
-async def cbb_edges_simple(
-    when: Optional[str] = None,
-    date: Optional[str] = None,
-    scope: str = Query("1H", pattern="^(1H|FG)$"),
-    sort: str = Query("spread", pattern="^(spread|total)$"),
-    limit: int = 25,
-):
-    """
-    Ranked edges for GPT with simple date language.
-    """
-    resolved = _resolve_when_to_date(when) or date
-    rows = await cbb_slate(date=resolved, scope=scope, include_markets=True)
-    key = "spreadHome" if sort == "spread" else "total"
-
-    def _abs_edge(row):
-        val = (row.get("edge") or {}).get(key)
-        return abs(val) if isinstance(val, (int, float)) else -1.0
-
-    ranked = sorted(rows, key=_abs_edge, reverse=True)
-    return ranked[:max(1, min(limit, 100))]
+    return {
+        **base,
+        "notes": None,
+        "model": {"gameId": base["gameId"], "scope": scope, **model},
+    }
