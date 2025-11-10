@@ -100,6 +100,72 @@ def _default_positions_for_stat(stat: str, positions: Optional[str]) -> str:
     return ""
 
 
+def _normalize_result(
+    raw: Any,
+    season_default: Optional[int],
+    week_default: Optional[int],
+) -> Dict[str, Any]:
+    """
+    Normalize whatever get_nfl_player_prop_lines returns into:
+    {
+      "rows": [...],
+      "season": <int or None>,
+      "week": <int or None>,
+      "diagnostics": {...}
+    }
+
+    Handles dicts or tuples.
+    """
+    # Case 1: already a dict
+    if isinstance(raw, dict):
+        rows = raw.get("rows") or []
+        season_out = raw.get("season", season_default)
+        week_out = raw.get("week", week_default)
+        diagnostics = raw.get("diagnostics") or {}
+        return {
+            "rows": rows,
+            "season": season_out,
+            "week": week_out,
+            "diagnostics": diagnostics,
+        }
+
+    # Case 2: tuple-like
+    if isinstance(raw, (tuple, list)):
+        # Guess the structure
+        if len(raw) == 2:
+            # (rows, diagnostics)
+            rows = raw[0] or []
+            diagnostics = raw[1] or {}
+            season_out = season_default
+            week_out = week_default
+        elif len(raw) >= 3:
+            # (rows, season, week, [diagnostics])
+            rows = raw[0] or []
+            season_out = raw[1] if raw[1] is not None else season_default
+            week_out = raw[2] if raw[2] is not None else week_default
+            diagnostics = raw[3] if len(raw) > 3 and raw[3] is not None else {}
+        else:
+            rows = raw[0] or []
+            season_out = season_default
+            week_out = week_default
+            diagnostics = {}
+
+        return {
+            "rows": rows,
+            "season": season_out,
+            "week": week_out,
+            "diagnostics": diagnostics,
+        }
+
+    # Fallback
+    return {
+        "rows": [],
+        "season": season_default,
+        "week": week_default,
+        "diagnostics": {"warning": "unexpected_result_type"},
+    }
+
+
 # ====================================================================
 # 1) Bulk props endpoint
 # ====================================================================
@@ -136,7 +202,7 @@ async def nfl_player_props(
 
         try:
             # POSitional call: (season, week, stat, positions, bookmakers, region, fast, debug)
-            result = await get_nfl_player_prop_lines(
+            raw_result = await get_nfl_player_prop_lines(
                 season,
                 week,
                 stat,
@@ -150,18 +216,20 @@ async def nfl_player_props(
             logger.exception("nfl_player_props failed for stat=%s: %s", stat, e)
             continue
 
-        if chosen_season is None:
-            chosen_season = result.get("season")
-        if chosen_week is None:
-            chosen_week = result.get("week")
+        norm = _normalize_result(raw_result, season, week)
 
-        rows = result.get("rows") or []
+        if chosen_season is None:
+            chosen_season = norm.get("season")
+        if chosen_week is None:
+            chosen_week = norm.get("week")
+
+        rows = norm.get("rows") or []
         for r in rows:
             if not include_markets:
                 r = {**r, "market": None, "edge": None}
             out_rows.append(r)
 
-        diagnostics_agg[stat] = result.get("diagnostics") or {}
+        diagnostics_agg[stat] = norm.get("diagnostics") or {}
 
     return {
         "season": chosen_season,
@@ -195,7 +263,7 @@ async def nfl_player_prop_edges(
     stat_positions = _default_positions_for_stat(stat, positions)
 
     try:
-        result = await get_nfl_player_prop_lines(
+        raw_result = await get_nfl_player_prop_lines(
             season,
             week,
             stat,
@@ -209,16 +277,17 @@ async def nfl_player_prop_edges(
         logger.exception("nfl_player_prop_edges failed: %s", e)
         raise HTTPException(status_code=500, detail="fetch_failed")
 
-    rows = result.get("rows") or []
+    norm = _normalize_result(raw_result, season, week)
+    rows = norm.get("rows") or []
     if limit:
         rows = rows[:limit]
 
     return {
-        "season": result.get("season"),
-        "week": result.get("week"),
+        "season": norm.get("season"),
+        "week": norm.get("week"),
         "stat": stat,
         "rows": rows,
-        "diagnostics": result.get("diagnostics"),
+        "diagnostics": norm.get("diagnostics"),
     }
 
 
@@ -262,7 +331,7 @@ async def nfl_player_prop_edges_simple(
 
     # --- Fetch fresh ---
     try:
-        result = await get_nfl_player_prop_lines(
+        raw_result = await get_nfl_player_prop_lines(
             season,
             week,
             stat,
@@ -276,16 +345,17 @@ async def nfl_player_prop_edges_simple(
         logger.exception("nfl_player_prop_edges_simple failed: %s", e)
         raise HTTPException(status_code=500, detail="fetch_failed")
 
-    rows = result.get("rows") or []
+    norm = _normalize_result(raw_result, season, week)
+    rows = norm.get("rows") or []
     if limit:
         rows = rows[:limit]
 
     response = {
-        "season": result.get("season"),
-        "week": result.get("week"),
+        "season": norm.get("season"),
+        "week": norm.get("week"),
         "stat": stat,
         "rows": rows,
-        "diagnostics": result.get("diagnostics"),
+        "diagnostics": norm.get("diagnostics"),
     }
 
     if not debug:
