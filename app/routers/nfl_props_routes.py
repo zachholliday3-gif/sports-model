@@ -148,7 +148,7 @@ async def nfl_player_props(
             result = await get_nfl_player_prop_lines(
                 season=season,
                 week=week,
-                stat=stat,
+                stat_key=stat,  # 🔑 match service signature
                 positions=stat_positions,
                 bookmakers=None,
                 region=None,
@@ -213,7 +213,7 @@ async def nfl_player_prop_edges(
         result = await get_nfl_player_prop_lines(
             season=season,
             week=week,
-            stat=stat,
+            stat_key=stat,  # 🔑 match service signature
             positions=stat_positions,
             bookmakers=bookmakers,
             region=region,
@@ -289,7 +289,7 @@ async def nfl_player_prop_edges_simple(
         result = await get_nfl_player_prop_lines(
             season=season,
             week=week,
-            stat=stat,
+            stat_key=stat,  # 🔑 match service signature
             positions=stat_positions,
             bookmakers=bookmakers,
             region=region,
