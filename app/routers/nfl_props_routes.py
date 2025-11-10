@@ -116,12 +116,14 @@ async def nfl_player_props(
     positions: Optional[str] = Query(None),
     fast: bool = Query(False),
 ):
-    """Aggregated props data across multiple stats."""
+    """
+    Aggregated NFL player props across multiple stats.
+    """
     if not stats:
         stats = "recYds,rushYds,passYds,receptions,passTDs"
 
     out_rows = []
-    diagnostics_agg = {}
+    diagnostics_agg: Dict[str, Any] = {}
     chosen_season = season
     chosen_week = week
 
@@ -133,15 +135,16 @@ async def nfl_player_props(
         stat_positions = _default_positions_for_stat(stat, positions)
 
         try:
+            # POSitional call: (season, week, stat, positions, bookmakers, region, fast, debug)
             result = await get_nfl_player_prop_lines(
-                season=season,
-                week=week,
-                stat=stat,  # ✅ using 'stat'
-                positions=stat_positions,
-                bookmakers=None,
-                region=None,
-                fast=fast,
-                debug=False,
+                season,
+                week,
+                stat,
+                stat_positions,
+                None,   # bookmakers
+                None,   # region
+                fast,
+                False,  # debug
             )
         except Exception as e:
             logger.exception("nfl_player_props failed for stat=%s: %s", stat, e)
@@ -193,14 +196,14 @@ async def nfl_player_prop_edges(
 
     try:
         result = await get_nfl_player_prop_lines(
-            season=season,
-            week=week,
-            stat=stat,  # ✅ using 'stat'
-            positions=stat_positions,
-            bookmakers=bookmakers,
-            region=region,
-            fast=fast,
-            debug=debug,
+            season,
+            week,
+            stat,
+            stat_positions,
+            bookmakers,
+            region,
+            fast,
+            debug,
         )
     except Exception as e:
         logger.exception("nfl_player_prop_edges failed: %s", e)
@@ -235,7 +238,11 @@ async def nfl_player_prop_edges_simple(
     fast: bool = Query(True),
     debug: bool = Query(False),
 ):
-    """GPT-friendly edges endpoint with caching."""
+    """
+    GPT-friendly NFL prop edges with caching.
+    Uses natural-language statLabel and sensible default positions,
+    then calls the underlying service and caches by (season, week, stat, positions, bookmakers, region, fast).
+    """
     label_norm = statLabel.strip().lower()
     if label_norm not in STAT_LABEL_MAP:
         raise HTTPException(status_code=400, detail="Unsupported statLabel.")
@@ -247,7 +254,7 @@ async def nfl_player_prop_edges_simple(
     if not debug:
         cached = _get_cached_edges(season, week, stat, stat_positions, bookmakers, region, fast)
         if cached:
-            logger.info("Cache hit: %s %s %s %s", season, week, stat, stat_positions)
+            logger.info("NFL props edges_simple cache hit: %s %s %s %s", season, week, stat, stat_positions)
             rows = cached.get("rows") or []
             if limit:
                 rows = rows[:limit]
@@ -256,14 +263,14 @@ async def nfl_player_prop_edges_simple(
     # --- Fetch fresh ---
     try:
         result = await get_nfl_player_prop_lines(
-            season=season,
-            week=week,
-            stat=stat,  # ✅ using 'stat'
-            positions=stat_positions,
-            bookmakers=bookmakers,
-            region=region,
-            fast=fast,
-            debug=debug,
+            season,
+            week,
+            stat,
+            stat_positions,
+            bookmakers,
+            region,
+            fast,
+            debug,
         )
     except Exception as e:
         logger.exception("nfl_player_prop_edges_simple failed: %s", e)
