@@ -11,7 +11,7 @@ import os
 from app.routers import cbb_routes, nfl_routes
 from app.routers import nfl_props_routes
 from app.routers import nfl_debug_routes
-from app.routers import cbb_routes, nfl_routes, nfl_props_routes, meta_routes, nhl_routes
+from app.routers import cbb_routes, nfl_routes, nfl_props_routes, nhl_routes
 
 # ------------ Logging ------------
 logging.basicConfig(level=logging.INFO)
@@ -80,7 +80,6 @@ app.include_router(cbb_routes.router, prefix="/api/cbb")
 app.include_router(nfl_routes.router, prefix="/api/nfl")
 app.include_router(nfl_props_routes.router, prefix="/api/nfl")
 app.include_router(nfl_debug_routes.router, prefix="/api/nfl")
-app.include_router(meta_routes.router, prefix="/api")
 app.include_router(nhl_routes.router, prefix="/api/nhl")
 
 
