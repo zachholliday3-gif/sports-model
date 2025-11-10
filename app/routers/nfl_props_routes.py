@@ -1,195 +1,320 @@
 # app/routers/nfl_props_routes.py
 from __future__ import annotations
 
-import asyncio
+from fastapi import APIRouter, HTTPException, Query
+from typing import Optional, Dict, Any, Tuple
+from datetime import datetime, timedelta
 import logging
-from typing import Dict, List, Optional
-from fastapi import APIRouter, Query, HTTPException
 
-from app.models.nfl_props_model import project_player_props
-from app.services.nfl_weeks import current_season_week, week_window
 from app.services.odds_api_nfl_props import get_nfl_player_prop_lines
 
+router = APIRouter(tags=["NFL Props"])
 logger = logging.getLogger("app.nfl_props")
-router = APIRouter(tags=["nfl-props"])
 
-def _parse_positions(s: Optional[str]) -> Optional[set]:
-    if not s:
-        return None
-    vals = [p.strip().upper() for p in s.split(",") if p.strip()]
-    return set(vals) if vals else None
+# ---------- Stat label → internal key mapping ----------
 
-def _pos_ok(entry_pos: Optional[str], want: Optional[set]) -> bool:
-    if not want:
-        return True
-    if not entry_pos:
-        return False
-    if entry_pos == "WR/TE":
-        return bool({"WR", "TE"} & want)
-    return entry_pos in want
-
-# ---------- robust stat label normalization ----------
-# Drop ALL non-alphanumeric characters so:
-# "receiving yards", "ReceivingYards", "receiving-yards" -> "receivingyards"
-def _canon_key(label: str) -> str:
-    return "".join(ch for ch in (label or "").lower() if ch.isalnum())
-
-_LABEL_TO_CANON = {
-    "receivingyards": "recYds",
+STAT_LABEL_MAP = {
+    "receiving yards": "recYds",
     "receptions": "receptions",
-    "rushingyards": "rushYds",
-    "passingyards": "passYds",
-    "passingtds": "passTDs",
-    # extras/aliases
-    "recyds": "recYds",
-    "receiving": "recYds",
-    "rushing": "rushYds",
-    "passing": "passYds",
-    "passtds": "passTDs",
-    "passtd": "passTDs",
-    "passtouchdowns": "passTDs",
+    "rushing yards": "rushYds",
+    "passing yards": "passYds",
+    "passing tds": "passTDs",
 }
-def _canon_stat(label: str) -> str | None:
-    return _LABEL_TO_CANON.get(_canon_key(label))
-# -----------------------------------------------------
+
+# ---------- Simple in-memory cache for edges_simple ----------
+
+# Keyed by: (season, week, stat, positions, bookmakers, region, fast)
+_EDGE_CACHE: Dict[Tuple[int, int, str, str, str, str, bool], Dict[str, Any]] = {}
+_EDGE_CACHE_TTL = timedelta(minutes=30)
+
+
+def _make_cache_key(
+    season: Optional[int],
+    week: Optional[int],
+    stat: str,
+    positions: Optional[str],
+    bookmakers: Optional[str],
+    region: Optional[str],
+    fast: bool,
+) -> Tuple[int, int, str, str, str, str, bool]:
+    return (
+        season or 0,
+        week or 0,
+        stat,
+        positions or "",
+        bookmakers or "",
+        region or "",
+        fast,
+    )
+
+
+def _get_cached_edges(
+    season: Optional[int],
+    week: Optional[int],
+    stat: str,
+    positions: Optional[str],
+    bookmakers: Optional[str],
+    region: Optional[str],
+    fast: bool,
+):
+    now = datetime.utcnow()
+    key = _make_cache_key(season, week, stat, positions, bookmakers, region, fast)
+    entry = _EDGE_CACHE.get(key)
+    if not entry:
+        return None
+    if entry["expires_at"] < now:
+        _EDGE_CACHE.pop(key, None)
+        return None
+    return entry["value"]
+
+
+def _set_cached_edges(
+    season: Optional[int],
+    week: Optional[int],
+    stat: str,
+    positions: Optional[str],
+    bookmakers: Optional[str],
+    region: Optional[str],
+    fast: bool,
+    value: Any,
+):
+    now = datetime.utcnow()
+    key = _make_cache_key(season, week, stat, positions, bookmakers, region, fast)
+    _EDGE_CACHE[key] = {
+        "value": value,
+        "expires_at": now + _EDGE_CACHE_TTL,
+    }
+
+
+# ---------- Helper: default positions based on stat ----------
+
+def _default_positions_for_stat(stat: str, positions: Optional[str]) -> str:
+    """
+    If positions is not provided, choose sensible defaults per stat.
+    """
+    if positions:
+        return positions
+
+    if stat == "recYds" or stat == "receptions":
+        return "WR,TE"
+    if stat == "rushYds":
+        return "RB"
+    if stat in ("passYds", "passTDs"):
+        return "QB"
+
+    return ""
+
+
+# ====================================================================
+# 1) Bulk props endpoint (less used by GPT, kept simple)
+# ====================================================================
 
 @router.get("/player_props")
 async def nfl_player_props(
-    season: Optional[int] = None,
-    week: Optional[int] = None,
-    stats: str = Query("recYds,receptions,rushYds,passYds,passTDs"),
-    include_markets: bool = True,
-    bookmakers: Optional[str] = Query(None, description="CSV, e.g. 'draftkings,fanduel'"),
-    region: Optional[str] = Query("us"),
-    debug: bool = False,
-    fast: bool = Query(False, description="Quick path (recYds only)"),
-    positions: Optional[str] = Query(None, description="CSV positions filter, e.g. 'WR,TE'"),
+    season: Optional[int] = Query(None),
+    week: Optional[int] = Query(None),
+    stats: Optional[str] = Query(
+        None,
+        description="CSV of internal stats: recYds,rushYds,passYds,receptions,passTDs"
+    ),
+    include_markets: bool = Query(True),
+    positions: Optional[str] = Query(None),
+    fast: bool = Query(False),
 ):
-    if season is None or week is None:
-        season, week = current_season_week()
+    """
+    NFL player prop projections (with edges when markets available).
 
-    want_stats = ["recYds"] if fast else [s.strip() for s in stats.split(",") if s.strip()]
-    bks = [b.strip() for b in (bookmakers or "").split(",") if b.strip()] or None
-    start_bound, end_bound = week_window(season, week)
+    This is a simple wrapper that can aggregate across multiple stats.
+    The GPT primarily uses the edges_simple endpoint; this is kept
+    for completeness.
+    """
+    if not stats:
+        stats = "recYds,rushYds,passYds,receptions,passTDs"
 
-    wait_secs = 6.0 if fast else 12.0
+    out_rows = []
+    diagnostics_agg = {}
+    chosen_season = season
+    chosen_week = week
 
-    try:
-        market_blob, diag = await asyncio.wait_for(
-            get_nfl_player_prop_lines(
-                season=season,
-                week=week,
-                want_stats=want_stats,
-                start_iso=start_bound,
-                end_iso=end_bound,
-                bookmakers=bks,
-                region=region or "us",
-                debug=debug,
-            ),
-            timeout=wait_secs,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("odds props fetch timeout (fast=%s)", fast)
-        market_blob, diag = {}, {"error": "timeout"}
-    except Exception as e:
-        logger.exception("odds props fetch failed: %s", e)
-        market_blob, diag = {}, {"error": "fetch_failed"}
-
-    want_positions = _parse_positions(positions)
-    rows: List[dict] = []
-    for _, entry in (market_blob or {}).items():
-        if not _pos_ok(entry.get("position"), want_positions):
+    for stat in stats.split(","):
+        stat = stat.strip()
+        if not stat:
             continue
 
-        team, opp = entry["team"], entry["opponent"]
-        model = project_player_props(
-            player_name=entry["player"],
-            position=entry.get("position"),
-            team=team,
-            opponent=opp,
-            game_total=43.0,
-            team_spread_home=0.0,
-        )
-        model = {k: v for k, v in model.items() if k in want_stats}
+        # Choose sensible positions if not provided
+        stat_positions = _default_positions_for_stat(stat, positions)
 
-        market = {}
-        edges = {}
-        for stat in want_stats:
-            ml = (entry.get("markets") or {}).get(stat)
-            if ml is not None:
-                market[stat] = ml
-                if stat in model:
-                    edges[stat] = round(model[stat] - ml, 2)
+        try:
+            result = await get_nfl_player_prop_lines(
+                season=season,
+                week=week,
+                stat=stat,
+                positions=stat_positions,
+                bookmakers=None,
+                region=None,
+                fast=fast,
+                debug=False,
+            )
+        except Exception as e:
+            logger.exception("nfl_player_props failed for stat=%s: %s", stat, e)
+            continue
 
-        rows.append({
-            "player": entry["player"],
-            "team": team,
-            "opponent": opp,
-            "position": entry.get("position"),
-            "model": model,
-            "market": ({"book": entry.get("book"), **market} if market else {}),
-            "edge": edges,
-        })
+        if chosen_season is None:
+            chosen_season = result.get("season")
+        if chosen_week is None:
+            chosen_week = result.get("week")
+
+        rows = result.get("rows") or []
+        for r in rows:
+            # Optionally filter out market/edge if include_markets=False
+            if not include_markets:
+                r = {**r, "market": None, "edge": None}
+            out_rows.append(r)
+
+        diag = result.get("diagnostics") or {}
+        diagnostics_agg[stat] = diag
 
     return {
-        "season": season,
-        "week": week,
-        "rows": rows,
-        "diagnostics": diag if debug else None,
-        "note": "Use positions=WR,TE to filter. Fast mode returns recYds only.",
+        "season": chosen_season,
+        "week": chosen_week,
+        "note": None,
+        "rows": out_rows,
+        "diagnostics": diagnostics_agg,
     }
+
+
+# ====================================================================
+# 2) Raw edges endpoint (stat key directly)
+# ====================================================================
 
 @router.get("/player_props/edges")
-async def nfl_player_props_edges(
-    season: Optional[int] = None,
-    week: Optional[int] = None,
-    stat: str = Query("recYds"),
-    limit: int = 25,
-    bookmakers: Optional[str] = Query(None),
-    region: Optional[str] = Query("us"),
-    debug: bool = False,
-    fast: bool = Query(False),
+async def nfl_player_prop_edges(
+    season: Optional[int] = Query(None),
+    week: Optional[int] = Query(None),
+    stat: str = Query(..., description="Internal stat key: recYds,rushYds,passYds,receptions,passTDs"),
+    limit: int = Query(25, ge=1, le=200),
     positions: Optional[str] = Query(None),
+    bookmakers: Optional[str] = Query(None),
+    region: Optional[str] = Query(None),
+    fast: bool = Query(True),
+    debug: bool = Query(False),
 ):
-    data = await nfl_player_props(
-        season=season, week=week, stats=stat, include_markets=True,
-        bookmakers=bookmakers, region=region, debug=debug, fast=fast, positions=positions,
-    )
-    rows = data.get("rows", [])
-    def _edge_abs(r):
-        v = (r.get("edge") or {}).get(stat)
-        return abs(v) if isinstance(v, (int, float)) else -1.0
-    ranked = sorted(rows, key=_edge_abs, reverse=True)
+    """
+    Raw NFL player prop edges for a single internal stat key.
+    The GPT should normally use /player_props/edges_simple instead.
+    """
+    stat = stat.strip()
+    if not stat:
+        raise HTTPException(status_code=400, detail="stat is required")
+
+    stat_positions = _default_positions_for_stat(stat, positions)
+
+    try:
+        result = await get_nfl_player_prop_lines(
+            season=season,
+            week=week,
+            stat=stat,
+            positions=stat_positions,
+            bookmakers=bookmakers,
+            region=region,
+            fast=fast,
+            debug=debug,
+        )
+    except Exception as e:
+        logger.exception("nfl_player_prop_edges failed: %s", e)
+        raise HTTPException(status_code=500, detail="fetch_failed")
+
+    rows = result.get("rows") or []
+    if limit:
+        rows = rows[:limit]
+
     return {
-        "season": data.get("season"),
-        "week": data.get("week"),
+        "season": result.get("season"),
+        "week": result.get("week"),
         "stat": stat,
-        "rows": ranked[:max(1, min(limit, 100))],
-        "diagnostics": data.get("diagnostics") if debug else None,
+        "rows": rows,
+        "diagnostics": result.get("diagnostics"),
     }
 
+
+# ====================================================================
+# 3) GPT-friendly edges endpoint (statLabel + CACHE)
+# ====================================================================
+
 @router.get("/player_props/edges_simple")
-async def nfl_player_props_edges_simple(
-    season: Optional[int] = None,
-    week: Optional[int] = None,
-    statLabel: str = Query("receiving yards"),
-    limit: int = 15,
+async def nfl_player_prop_edges_simple(
+    season: Optional[int] = Query(None),
+    week: Optional[int] = Query(None),
+    statLabel: str = Query(..., description="e.g. 'receiving yards', 'receptions', 'rushing yards', 'passing yards', 'passing tds'"),
+    limit: int = Query(25, ge=1, le=200),
     bookmakers: Optional[str] = Query(None),
     region: Optional[str] = Query("us"),
-    debug: bool = False,
-    fast: bool = Query(True, description="Default fast mode for Actions"),
-    positions: Optional[str] = Query(None, description="CSV; defaults to WR,TE for receiving/receptions"),
+    positions: Optional[str] = Query(None),
+    fast: bool = Query(True),
+    debug: bool = Query(False),
 ):
-    canon = _canon_stat(statLabel)
-    if not canon:
+    """
+    GPT-friendly NFL player prop edges:
+    - statLabel is natural-language (receiving yards, receptions, etc)
+    - We apply sensible default positions (WR/TE for receiving, etc)
+    - We cache responses to reduce upstream rate limiting
+    """
+    label_norm = statLabel.strip().lower()
+    if label_norm not in STAT_LABEL_MAP:
         raise HTTPException(status_code=400, detail="Unsupported statLabel.")
 
-    if positions is None and canon in ("recYds", "receptions"):
-        positions = "WR,TE"
+    stat = STAT_LABEL_MAP[label_norm]
+    stat_positions = _default_positions_for_stat(stat, positions)
 
-    data = await nfl_player_props_edges(
-        season=season, week=week, stat=canon, limit=limit,
-        bookmakers=bookmakers, region=region, debug=debug, fast=fast, positions=positions,
-    )
-    data["rows"] = data.get("rows", [])[:max(1, min(limit, 25))]
-    return data
+    # ---------- 1) Try cache first (if not debug) ----------
+    if not debug:
+        cached = _get_cached_edges(season, week, stat, stat_positions, bookmakers, region, fast)
+        if cached is not None:
+            logger.info(
+                "NFL props edges_simple cache hit: season=%s week=%s stat=%s positions=%s",
+                season, week, stat, stat_positions,
+            )
+            # Apply limit on top of cached rows
+            rows = cached.get("rows") or []
+            if limit:
+                rows = rows[:limit]
+            return {
+                **cached,
+                "rows": rows,
+                "stat": stat,
+            }
+
+    # ---------- 2) Call underlying service ----------
+    try:
+        result = await get_nfl_player_prop_lines(
+            season=season,
+            week=week,
+            stat=stat,
+            positions=stat_positions,
+            bookmakers=bookmakers,
+            region=region,
+            fast=fast,
+            debug=debug,
+        )
+    except Exception as e:
+        logger.exception("nfl_player_prop_edges_simple failed: %s", e)
+        raise HTTPException(status_code=500, detail="fetch_failed")
+
+    # Enforce limit
+    rows = result.get("rows") or []
+    if limit:
+        rows = rows[:limit]
+
+    response = {
+        "season": result.get("season"),
+        "week": result.get("week"),
+        "stat": stat,
+        "rows": rows,
+        "diagnostics": result.get("diagnostics"),
+    }
+
+    # ---------- 3) Store in cache ----------
+    if not debug:
+        _set_cached_edges(season, week, stat, stat_positions, bookmakers, region, fast, response)
+
+    return response
