@@ -10,7 +10,7 @@ import random
 
 logger = logging.getLogger("app.espn_cfb")
 
-# ESPN College Football scoreboard (NOTE: this is football/college-football)
+# ✅ ESPN College Football scoreboard (NOT NHL)
 SITE_BASE = "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard"
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
@@ -47,7 +47,7 @@ def _yyyymmdd(date_str: Optional[str]) -> str:
 
     try:
         dt = datetime.fromisoformat(s[:10])
-        return dt.strftime("%Y%mdd")
+        return dt.strftime("%Y%m%d")
     except Exception:
         logger.warning("espn_cfb: could not parse date '%s', falling back to NY today", date_str)
         return _ny_today_yyyymmdd()

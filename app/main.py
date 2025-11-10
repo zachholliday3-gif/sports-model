@@ -81,6 +81,6 @@ app.include_router(nfl_routes.router, prefix="/api/nfl")
 app.include_router(nfl_props_routes.router, prefix="/api/nfl")
 app.include_router(nfl_debug_routes.router, prefix="/api/nfl")
 app.include_router(nhl_routes.router, prefix="/api/nhl")
-app.include_router(nhl_routes.router, prefix="/api/cfb")
+app.include_router(cfb_routes.router, prefix="/api/cfb")
 
 
