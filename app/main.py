@@ -8,10 +8,10 @@ import time
 import os
 
 # Routers
-from app.routers import cbb_routes, nfl_routes, nhl_routes
+from app.routers import cbb_routes, nfl_routes
 from app.routers import nfl_props_routes
 from app.routers import nfl_debug_routes
-from app.routers import cbb_routes, nfl_routes, nfl_props_routes, meta_routes
+from app.routers import cbb_routes, nfl_routes, nfl_props_routes, meta_routes, nhl_routes
 
 # ------------ Logging ------------
 logging.basicConfig(level=logging.INFO)
