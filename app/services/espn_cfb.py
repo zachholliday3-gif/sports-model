@@ -10,12 +10,12 @@ import random
 
 logger = logging.getLogger("app.espn_cfb")
 
-# ESPN College Football scoreboard
+# ESPN College Football scoreboard (NOTE: this is football/college-football)
 SITE_BASE = "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard"
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
 
-# ---------- Date helpers (same pattern as CBB/NHL/NFL) ----------
+# ---------- Date helpers (same style as CBB/NHL/NFL) ----------
 
 def _ny_today_yyyymmdd() -> str:
     """
@@ -41,15 +41,13 @@ def _yyyymmdd(date_str: Optional[str]) -> str:
         return _ny_today_yyyymmdd()
 
     s = date_str.strip()
-    # keep only digits
     digits = re.sub(r"\D", "", s)
     if len(digits) == 8:
         return digits
 
-    # fallback: use first 10 chars as ISO date
     try:
         dt = datetime.fromisoformat(s[:10])
-        return dt.strftime("%Y%m%d")
+        return dt.strftime("%Y%mdd")
     except Exception:
         logger.warning("espn_cfb: could not parse date '%s', falling back to NY today", date_str)
         return _ny_today_yyyymmdd()
@@ -78,7 +76,7 @@ def _site_params(date_yyyymmdd: str, fbs_only: bool) -> Dict[str, Any]:
     """
     Build ESPN site params.
 
-    - ESPN CFB 'groups=80' ~= FBS
+    - ESPN CFB 'groups=80' ~= FBS (top division)
     - If fbs_only=True, we send groups=80 first; if that returns 0 events,
       we'll retry without groups (all levels).
     """
@@ -87,7 +85,7 @@ def _site_params(date_yyyymmdd: str, fbs_only: bool) -> Dict[str, Any]:
         "limit": 500,
     }
     if fbs_only:
-        params["groups"] = 80  # FBS
+        params["groups"] = 80  # FBS group
     return params
 
 

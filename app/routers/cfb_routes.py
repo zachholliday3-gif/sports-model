@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
-from typing import List, Optional
+from typing import Optional
 import logging
 
 from app.services.espn_cfb import get_games_for_date, project_cfb_fg
