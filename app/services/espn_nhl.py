@@ -3,39 +3,59 @@ from __future__ import annotations
 
 import httpx
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import re
-import random
 from typing import Any, Dict, List, Optional
+import random
 
 logger = logging.getLogger("app.espn_nhl")
 
+# ESPN NHL scoreboard (site)
 SITE_BASE = "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard"
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
 
-def _today_iso() -> str:
-    """UTC 'today' as YYYY-MM-DD."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+# ---------- Date helpers (same pattern as CBB/NFL style) ----------
 
-
-def _normalize_date(date_str: Optional[str]) -> str:
+def _ny_today_yyyymmdd() -> str:
     """
-    Accept 'YYYY-MM-DD', 'YYYYMMDD', or similar, and normalize to 'YYYY-MM-DD'.
-    If None/invalid, use today.
+    Treat 'today' as America/New_York (similar convention as CBB/NFL:
+    UTC minus 5 hours).
+    """
+    ny_now = datetime.now(timezone.utc) - timedelta(hours=5)
+    return ny_now.strftime("%Y%m%d")
+
+
+def _yyyymmdd(date_str: Optional[str]) -> str:
+    """
+    Normalize incoming date to strictly 'YYYYMMDD'.
+
+    Accepts:
+      - 'YYYYMMDD'
+      - 'YYYY-MM-DD'
+      - other ISO-like strings
+
+    If missing or invalid, falls back to NY 'today'.
     """
     if not date_str:
-        return _today_iso()
+        return _ny_today_yyyymmdd()
 
     s = date_str.strip()
+    # Strip everything but digits
     digits = re.sub(r"\D", "", s)
     if len(digits) == 8:
-        # YYYYMMDD -> YYYY-MM-DD
-        return f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]}"
+        return digits
 
-    # Fallback: keep first 10 chars (likely ISO)
-    return s[:10]
+    # Fallback: try parse first 10 chars (likely 'YYYY-MM-DD')
+    try:
+        dt = datetime.fromisoformat(s[:10])
+        return dt.strftime("%Y%m%d")
+    except Exception:
+        logger.warning("espn_nhl: could not parse date '%s', falling back to NY today", date_str)
+        return _ny_today_yyyymmdd()
 
+
+# ---------- HTTP helper ----------
 
 async def _get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """Small retry wrapper for ESPN NHL."""
@@ -51,6 +71,8 @@ async def _get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
                 logger.warning("espn_nhl _get_json attempt %d failed: %s", attempt + 1, e)
     raise last or RuntimeError("unknown http error")
 
+
+# ---------- Extraction ----------
 
 def _extract_game_lite(ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     comps = (ev.get("competitions") or [{}])[0]
@@ -70,14 +92,18 @@ def _extract_game_lite(ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+# ---------- Public API ----------
+
 async def get_games_for_date(date: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Fetch NHL games for the given date.
-    - date: 'YYYY-MM-DD' or 'YYYYMMDD' or None (today UTC)
+
+    - date: 'YYYYMMDD' or 'YYYY-MM-DD' or None (today in NY)
+    - ESPN NHL expects 'dates' in 'YYYYMMDD' format (no range).
     """
-    d = _normalize_date(date)
-    params = {"dates": f"{d}-{d}", "limit": 500}
-    logger.info("NHL get_games_for_date params=%s", params)
+    d = _yyyymmdd(date)
+    params = {"dates": d, "limit": 500}
+    logger.info("NHL get_games_for_date date=%s params=%s", d, params)
 
     data = await _get_json(SITE_BASE, params)
     events = data.get("events") or []
@@ -95,15 +121,13 @@ async def get_games_for_date(date: Optional[str] = None) -> List[Dict[str, Any]]
 def project_nhl_fg(home_team: str, away_team: str) -> Dict[str, Any]:
     """
     Simple placeholder NHL full-game projection.
-    Later you can replace this with a real model.
+    Later you can replace this with a real model fed from stats.
     """
-    # Base total range ~ typical NHL scoring environment
+    # Typical NHL scoring environment
     base_total = round(random.uniform(5.5, 6.8), 1)
-
-    # Slight home advantage baked in
+    # Mild home edge in spread
     spread = round(random.uniform(-1.5, 1.5), 1)
-
-    # Arbitrary confidence for now
+    # Arbitrary confidence range
     confidence = round(random.uniform(0.55, 0.9), 2)
 
     return {
