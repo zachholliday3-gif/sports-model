@@ -30,7 +30,7 @@ async def _fetch_scoreboard_day(sport: str, day: date) -> List[Dict[str, Any]]:
     datestr = day.strftime("%Y%m%d")
     params = {"dates": datestr, "limit": 500}
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.get(base, params=params)
         r.raise_for_status()
         data = r.json()
@@ -96,7 +96,8 @@ async def _get_last_n_games_for_team(
     Look back from TODAY up to max_back_days, walking backwards day by day
     and collecting COMPLETED games for this team_id, up to at most n.
 
-    This fixes the old behavior that was stuck on an August 2025 window.
+    This version is robust to ESPN timeouts/HTTP errors:
+    - If a day fails (timeout, 5xx, etc.), we log and skip it.
     """
     today = date.today()
     collected: List[Dict[str, Any]] = []
@@ -108,7 +109,7 @@ async def _get_last_n_games_for_team(
         day = today - timedelta(days=delta)
         try:
             events = await _fetch_scoreboard_day(sport, day)
-        except httpx.HTTPStatusError as e:
+        except (httpx.HTTPStatusError, httpx.RequestError) as e:
             logger.warning("FORM %s day=%s failed: %s", sport, day, e)
             continue
 
@@ -234,7 +235,7 @@ async def matchup_form(
     """
     Get last-N form for two teams (team1 vs team2) for a given sport.
 
-    Response shape matches what your GPT YAML expects:
+    Response shape:
     {
       "sport": "cbb",
       "nRequested": 5,
