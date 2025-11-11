@@ -1,258 +1,184 @@
 # app/services/last5_form.py
 
-from __future__ import annotations
-
-from typing import Dict, Any, List, Tuple
-from datetime import datetime, timedelta, timezone
-import httpx
 import logging
+from datetime import datetime, timedelta
 
-logger = logging.getLogger("app.last5")
+from app.services import espn_cbb, espn_nfl, espn_nhl, espn_cfb
 
-ESPN_SITE_BASE = "https://site.api.espn.com/apis/site/v2/sports"
-
-# Supported sports and how to interpret periods
-SPORT_CONFIG = {
-    "cbb": {
-        "site_path": "basketball/mens-college-basketball",
-        "period_mode": "half",   # 1H = first half
-    },
-    "nfl": {
-        "site_path": "football/nfl",
-        "period_mode": "quarter",  # 1H = Q1 + Q2
-    },
-    "cfb": {
-        "site_path": "football/college-football",
-        "period_mode": "quarter",  # 1H = Q1 + Q2
-    },
-    "nhl": {
-        "site_path": "hockey/nhl",
-        "period_mode": "period",   # "1H" = 1st period
-    },
-}
+logger = logging.getLogger("app.form")
 
 
-async def _get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+# -------------------------------------------------
+# Helper: choose correct ESPN getter based on sport
+# -------------------------------------------------
+async def _get_games_for_date(sport: str, date_str: str, d1_only: bool = True):
     """
-    Simple HTTP GET with basic error handling for ESPN JSON.
+    Dispatch to the correct ESPN date-based fetcher for each sport.
+    For CBB we support the d1_only filter (via groups=50 on ESPN).
+    Other sports ignore d1_only.
     """
-    async with httpx.AsyncClient(timeout=8.0) as client:
-        resp = await client.get(url, params=params)
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            logger.warning("last5 _get_json failed: %s", e)
-            raise
-        return resp.json()
-
-
-def _extract_scores_for_team(
-    comp: Dict[str, Any],
-    team_id: str,
-    sport: str,
-) -> Tuple[int, int, int, int]:
-    """
-    From one ESPN competition, pull full-game + 1H-equivalent scores
-    for the given team_id and its opponent.
-
-    Returns: (team1H, opp1H, teamFull, oppFull)
-    """
-    competitors = comp.get("competitors") or comp.get("competitors", [])
-    if not competitors or len(competitors) < 2:
-        return 0, 0, 0, 0
-
-    idx = None
-    for i, c in enumerate(competitors):
-        team = c.get("team") or {}
-        if str(team.get("id")) == str(team_id):
-            idx = i
-            break
-
-    if idx is None:
-        return 0, 0, 0, 0
-
-    team_comp = competitors[idx]
-    opp_comp = competitors[1 - idx]
-
-    # Full-game scores
-    try:
-        team_full = int(team_comp.get("score") or 0)
-    except ValueError:
-        team_full = 0
-    try:
-        opp_full = int(opp_comp.get("score") or 0)
-    except ValueError:
-        opp_full = 0
-
-    # 1H-equivalent scores
-    lines_team = team_comp.get("linescores") or []
-    lines_opp = opp_comp.get("linescores") or []
-
-    def _val(ls, i):
-        try:
-            return int(ls[i].get("value") or 0)
-        except Exception:
-            return 0
-
-    mode = SPORT_CONFIG[sport]["period_mode"]
-
-    if mode == "half":
-        # 1H = first half only
-        team_1h = _val(lines_team, 0)
-        opp_1h = _val(lines_opp, 0)
-    elif mode == "quarter":
-        # 1H = Q1 + Q2
-        team_1h = _val(lines_team, 0) + _val(lines_team, 1)
-        opp_1h = _val(lines_opp, 0) + _val(lines_opp, 1)
-    elif mode == "period":
-        # 1H = first period
-        team_1h = _val(lines_team, 0)
-        opp_1h = _val(lines_opp, 0)
+    if sport == "cbb":
+        # Your existing CBB helper already understands d1_only
+        return await espn_cbb.get_games_for_date(date_str, d1_only=d1_only)
+    elif sport == "nfl":
+        return await espn_nfl.get_games_for_date(date_str)
+    elif sport == "nhl":
+        return await espn_nhl.get_games_for_date(date_str)
+    elif sport == "cfb":
+        return await espn_cfb.get_games_for_date(date_str)
     else:
-        team_1h = 0
-        opp_1h = 0
-
-    return team_1h, opp_1h, team_full, opp_full
-
-
-async def get_last5_for_team(
-    sport: str,
-    team_id: str,
-    n: int = 5,
-    max_days_back: int = 90,
-) -> Dict[str, Any]:
-    """
-    Generic ESPN-based "last N games" fetcher.
-
-    - sport: one of "cbb", "nfl", "cfb", "nhl"
-    - team_id: ESPN team id as string
-    - n: number of games to collect (default 5)
-    - max_days_back: safety window so we don't loop forever
-
-    Returns structure with games + averages.
-    """
-    sport = sport.lower()
-    if sport not in SPORT_CONFIG:
         raise ValueError(f"Unsupported sport: {sport}")
 
-    site_path = SPORT_CONFIG[sport]["site_path"]
-    url = f"{ESPN_SITE_BASE}/{site_path}/scoreboard"
 
-    today = datetime.now(timezone.utc).date()
-    games: List[Dict[str, Any]] = []
-    team_name = None
+# -------------------------------------------------
+# Core logic: last N completed games for one team
+# -------------------------------------------------
+async def _get_last_n_games_for_team(sport: str, team_id: str, n: int = 5):
+    """
+    Walk backward day by day until we collect up to `n` completed games for this team.
 
-    # Look backwards day-by-day until we get N games or hit max_days_back
-    for day_offset in range(max_days_back):
-        if len(games) >= n:
+    To avoid hammering off-season dates, we:
+      - Only look back up to ~90 days.
+      - Stop early once we cross a rough season-start cutoff per sport.
+      - Stop if we see 15 consecutive days with no games for this sport/team.
+    """
+    today = datetime.utcnow().date()
+    results = []
+    zero_days = 0
+
+    # Approximate season start cutoffs
+    cutoff_map = {
+        "cbb": datetime(today.year, 11, 1).date(),   # early November
+        "cfb": datetime(today.year, 8, 15).date(),   # mid-August
+        "nfl": datetime(today.year, 9, 1).date(),    # early September
+        "nhl": datetime(today.year, 9, 15).date(),   # mid-September
+    }
+    cutoff_date = cutoff_map.get(sport, datetime(today.year, 1, 1).date())
+
+    for i in range(0, 90):  # up to ~90 days back
+        dt = today - timedelta(days=i)
+
+        # Don't search before the approximate season start
+        if dt < cutoff_date:
+            logger.info(
+                "%s reached season cutoff %s for team %s, stopping search.",
+                sport.upper(),
+                cutoff_date,
+                team_id,
+            )
             break
 
-        day = today - timedelta(days=day_offset + 1)  # only past days
-        dates_param = day.strftime("%Y%m%d")
-        params = {
-            "dates": dates_param,
-            "limit": 500,
-        }
+        date_str = dt.strftime("%Y%m%d")
+        games = await _get_games_for_date(sport, date_str, d1_only=True)
 
-        try:
-            data = await _get_json(url, params)
-        except Exception as e:
-            logger.warning("last5 scoreboard fetch failed: sport=%s date=%s err=%s", sport, dates_param, e)
+        if not games:
+            zero_days += 1
+            logger.info("FORM %s %s %s -> 0 events", sport, team_id, date_str)
+            if zero_days >= 15:
+                logger.info(
+                    "%s no games for team %s after %d days — stopping early.",
+                    sport.upper(),
+                    team_id,
+                    zero_days,
+                )
+                break
             continue
 
-        events = data.get("events") or []
-        for ev in events:
-            if len(games) >= n:
+        zero_days = 0  # reset after a day that has games
+
+        # Filter games for this team & that are final
+        for g in games:
+            home_id = str(g.get("homeId"))
+            away_id = str(g.get("awayId"))
+            if str(team_id) not in (home_id, away_id):
+                continue
+
+            # Only use completed / final games
+            status = (g.get("status") or "").lower()
+            if status not in ("final", "completed", "post"):
+                continue
+
+            results.append(g)
+            if len(results) >= n:
                 break
 
-            # competitions[0] is the game
-            comps = ev.get("competitions") or []
-            if not comps:
-                continue
-            comp = comps[0]
+        if len(results) >= n:
+            break
 
-            status = comp.get("status", {}).get("type", {})
-            state = status.get("state")
-            completed = status.get("completed", False)
-            if not completed and state != "post":
-                # skip non-final games
-                continue
+    logger.info("FORM %s %s -> %d games found", sport, team_id, len(results))
+    return results
 
-            competitors = comp.get("competitors") or []
-            if len(competitors) < 2:
-                continue
 
-            # Is our team in this game?
-            this_idx = None
-            for i, c in enumerate(competitors):
-                t = c.get("team") or {}
-                if str(t.get("id")) == str(team_id):
-                    this_idx = i
-                    if team_name is None:
-                        team_name = t.get("displayName") or t.get("name") or str(team_id)
-                    break
+# -------------------------------------------------
+# Public helpers for routers
+# -------------------------------------------------
+async def get_form_summary(sport: str, team_id: str, n: int = 5):
+    """
+    Return a summary of recent form for one team:
+    - nRequested / nFound
+    - avgFull_scored / avgFull_allowed
+    - avg1H_scored / avg1H_allowed (when available in the ESPN payload)
+    """
+    games = await _get_last_n_games_for_team(sport, team_id, n)
+    if not games:
+        return {
+            "sport": sport,
+            "teamId": team_id,
+            "nRequested": n,
+            "nFound": 0,
+        }
 
-            if this_idx is None:
-                continue  # not our team
+    scored_full = []
+    allowed_full = []
+    scored_1h = []
+    allowed_1h = []
 
-            this_comp = competitors[this_idx]
-            opp_comp = competitors[1 - this_idx]
-            opp_team = opp_comp.get("team") or {}
+    for g in games:
+        home_id = str(g.get("homeId"))
+        away_id = str(g.get("awayId"))
 
-            team_1h, opp_1h, team_full, opp_full = _extract_scores_for_team(comp, team_id, sport)
+        # ESPN-normalized scores (your event extraction should already set these)
+        home_full = g.get("homeScore")
+        away_full = g.get("awayScore")
+        home_1h = g.get("homeScore1H")
+        away_1h = g.get("awayScore1H")
 
-            # Build row
-            row = {
-                "eventId": str(ev.get("id") or comp.get("id")),
-                "date": ev.get("date"),
-                "opponent": opp_team.get("displayName") or opp_team.get("name"),
-                "opponentId": str(opp_team.get("id")) if opp_team.get("id") is not None else None,
-                "homeAway": this_comp.get("homeAway"),
-                "teamScore1H": team_1h,
-                "oppScore1H": opp_1h,
-                "total1H": team_1h + opp_1h,
-                "teamScoreFull": team_full,
-                "oppScoreFull": opp_full,
-                "totalFull": team_full + opp_full,
-                "result": None,
-            }
+        if str(team_id) == home_id:
+            scored_full.append(home_full)
+            allowed_full.append(away_full)
+            scored_1h.append(home_1h)
+            allowed_1h.append(away_1h)
+        elif str(team_id) == away_id:
+            scored_full.append(away_full)
+            allowed_full.append(home_full)
+            scored_1h.append(away_1h)
+            allowed_1h.append(home_1h)
 
-            if team_full > opp_full:
-                row["result"] = "W"
-            elif team_full < opp_full:
-                row["result"] = "L"
-            else:
-                row["result"] = "T"
-
-            games.append(row)
-
-        # end for events
-
-    # Compute averages
-    def _avg(vals: List[int]) -> float:
-        if not vals:
-            return 0.0
-        return round(sum(vals) / len(vals), 2)
-
-    avg_1h_scored = _avg([g["teamScore1H"] for g in games])
-    avg_1h_allowed = _avg([g["oppScore1H"] for g in games])
-    avg_1h_total = _avg([g["total1H"] for g in games])
-
-    avg_full_scored = _avg([g["teamScoreFull"] for g in games])
-    avg_full_allowed = _avg([g["oppScoreFull"] for g in games])
-    avg_full_total = _avg([g["totalFull"] for g in games])
+    def avg(arr):
+        arr = [a for a in arr if isinstance(a, (int, float))]
+        return round(sum(arr) / len(arr), 1) if arr else None
 
     return {
         "sport": sport,
-        "teamId": str(team_id),
-        "teamName": team_name or str(team_id),
+        "teamId": team_id,
         "nRequested": n,
         "nFound": len(games),
-        "games": games,
-        "avg1H_scored": avg_1h_scored,
-        "avg1H_allowed": avg_1h_allowed,
-        "avg1H_total": avg_1h_total,
-        "avgFull_scored": avg_full_scored,
-        "avgFull_allowed": avg_full_allowed,
-        "avgFull_total": avg_full_total,
+        "avgFull_scored": avg(scored_full),
+        "avgFull_allowed": avg(allowed_full),
+        "avg1H_scored": avg(scored_1h),
+        "avg1H_allowed": avg(allowed_1h),
+    }
+
+
+async def get_matchup_form(sport: str, team1_id: str, team2_id: str, n: int = 5):
+    """
+    Side-by-side form summary for both teams in a matchup.
+    """
+    team1 = await get_form_summary(sport, team1_id, n)
+    team2 = await get_form_summary(sport, team2_id, n)
+    return {
+        "sport": sport,
+        "nRequested": n,
+        "team1": team1,
+        "team2": team2,
     }
