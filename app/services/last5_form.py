@@ -1,184 +1,289 @@
 # app/services/last5_form.py
 
+import datetime as dt
 import logging
-from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
-from app.services import espn_cbb, espn_nfl, espn_nhl, espn_cfb
+import httpx
 
 logger = logging.getLogger("app.form")
 
+# -----------------------------
+# ESPN SCOREBOARD CONFIG PER SPORT
+# -----------------------------
 
-# -------------------------------------------------
-# Helper: choose correct ESPN getter based on sport
-# -------------------------------------------------
-async def _get_games_for_date(sport: str, date_str: str, d1_only: bool = True):
+SPORT_CONFIG = {
+    # Men's College Basketball
+    "cbb": {
+        "url": "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard",
+        "params": {"groups": 50, "limit": 500},  # D1
+    },
+    # NFL
+    "nfl": {
+        "url": "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
+        "params": {"limit": 500},
+    },
+    # NHL
+    "nhl": {
+        "url": "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",
+        "params": {"limit": 500},
+    },
+    # College Football (FBS+)
+    "cfb": {
+        "url": "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard",
+        "params": {"groups": 80, "limit": 500},  # all D1
+    },
+}
+
+
+# -----------------------------
+# HTTP + ESPN HELPERS
+# -----------------------------
+
+async def _get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Dispatch to the correct ESPN date-based fetcher for each sport.
-    For CBB we support the d1_only filter (via groups=50 on ESPN).
-    Other sports ignore d1_only.
+    Simple wrapper around httpx to fetch JSON with basic retry.
     """
-    if sport == "cbb":
-        # Your existing CBB helper already understands d1_only
-        return await espn_cbb.get_games_for_date(date_str, d1_only=d1_only)
-    elif sport == "nfl":
-        return await espn_nfl.get_games_for_date(date_str)
-    elif sport == "nhl":
-        return await espn_nhl.get_games_for_date(date_str)
-    elif sport == "cfb":
-        return await espn_cfb.get_games_for_date(date_str)
-    else:
-        raise ValueError(f"Unsupported sport: {sport}")
+    last_exc: Optional[Exception] = None
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for attempt in range(2):
+            try:
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                return r.json()
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("FORM _get_json attempt %s failed: %s", attempt + 1, exc)
+        logger.error("FORM _get_json failed for %s params=%s: %s", url, params, last_exc)
+        raise last_exc or RuntimeError("unknown http error")
 
 
-# -------------------------------------------------
-# Core logic: last N completed games for one team
-# -------------------------------------------------
-async def _get_last_n_games_for_team(sport: str, team_id: str, n: int = 5):
+async def _fetch_scoreboard_events(
+    sport: str,
+    date_str: str,
+) -> List[Dict[str, Any]]:
     """
-    Walk backward day by day until we collect up to `n` completed games for this team.
-
-    To avoid hammering off-season dates, we:
-      - Only look back up to ~90 days.
-      - Stop early once we cross a rough season-start cutoff per sport.
-      - Stop if we see 15 consecutive days with no games for this sport/team.
+    Fetch ESPN scoreboard events for a given sport + date (YYYYMMDD).
     """
-    today = datetime.utcnow().date()
-    results = []
-    zero_days = 0
+    cfg = SPORT_CONFIG.get(sport)
+    if not cfg:
+        logger.warning("FORM: unsupported sport=%s", sport)
+        return []
 
-    # Approximate season start cutoffs
-    cutoff_map = {
-        "cbb": datetime(today.year, 11, 1).date(),   # early November
-        "cfb": datetime(today.year, 8, 15).date(),   # mid-August
-        "nfl": datetime(today.year, 9, 1).date(),    # early September
-        "nhl": datetime(today.year, 9, 15).date(),   # mid-September
-    }
-    cutoff_date = cutoff_map.get(sport, datetime(today.year, 1, 1).date())
+    params = dict(cfg["params"])
+    params["dates"] = date_str
 
-    for i in range(0, 90):  # up to ~90 days back
-        dt = today - timedelta(days=i)
+    data = await _get_json(cfg["url"], params)
+    events = data.get("events") or []
+    logger.info("FORM %s scoreboard %s -> %d events", sport, date_str, len(events))
+    return events
 
-        # Don't search before the approximate season start
-        if dt < cutoff_date:
-            logger.info(
-                "%s reached season cutoff %s for team %s, stopping search.",
-                sport.upper(),
-                cutoff_date,
-                team_id,
-            )
+
+def _extract_team_view_from_event(
+    sport: str,
+    team_id: str,
+    event: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    Given a raw ESPN scoreboard event and a team_id, return a "view" of that game
+    from the perspective of that team: final score, 1H score, opponent, etc.
+
+    Only returns data for COMPLETED games ("post").
+    """
+    try:
+        competitions = event.get("competitions") or []
+        if not competitions:
+            return None
+        comp = competitions[0]
+
+        status = (comp.get("status") or {}).get("type") or {}
+        state = status.get("state")
+        if state != "post":
+            # we only want completed games
+            return None
+
+        competitors = comp.get("competitors") or []
+        if len(competitors) < 2:
+            return None
+
+        team_id_str = str(team_id)
+
+        team_comp: Optional[Dict[str, Any]] = None
+        opp_comp: Optional[Dict[str, Any]] = None
+
+        for c in competitors:
+            team = c.get("team") or {}
+            tid = str(team.get("id"))
+            if tid == team_id_str:
+                team_comp = c
+            else:
+                # first non-matching competitor is our opponent
+                if opp_comp is None:
+                    opp_comp = c
+
+        if not team_comp or not opp_comp:
+            return None
+
+        def _get_scores(c: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+            try:
+                full = c.get("score")
+                full_int = int(full) if full is not None and full != "" else None
+            except Exception:
+                full_int = None
+
+            lines = c.get("linescores") or []
+            first_half: Optional[int] = None
+            if lines:
+                # For CBB and many sports, first entry is 1H/1st period.
+                try:
+                    val = lines[0].get("value")
+                    first_half = int(val) if val is not None and val != "" else None
+                except Exception:
+                    first_half = None
+            return full_int, first_half
+
+        t_full, t_1h = _get_scores(team_comp)
+        o_full, o_1h = _get_scores(opp_comp)
+
+        t_team = team_comp.get("team") or {}
+        o_team = opp_comp.get("team") or {}
+
+        view = {
+            "eventId": event.get("id"),
+            "sport": sport,
+            "teamId": t_team.get("id"),
+            "teamName": t_team.get("displayName") or t_team.get("name"),
+            "teamAbbr": t_team.get("abbreviation"),
+            "opponentId": o_team.get("id"),
+            "opponentName": o_team.get("displayName") or o_team.get("name"),
+            "opponentAbbr": o_team.get("abbreviation"),
+            "isHome": (team_comp.get("homeAway") == "home"),
+            "final": t_full,
+            "oppFinal": o_full,
+            "firstHalf": t_1h,
+            "oppFirstHalf": o_1h,
+            "state": state,
+            "date": event.get("date"),
+        }
+        return view
+    except Exception as exc:
+        logger.exception("FORM extract_team_view failed: %s", exc)
+        return None
+
+
+async def _get_last_n_games_for_team_generic(
+    sport: str,
+    team_id: str,
+    n: int = 5,
+    max_days_back: int = 60,
+) -> List[Dict[str, Any]]:
+    """
+    Generic "last N games" via ESPN scoreboard for any supported sport.
+
+    - Looks back up to `max_days_back` days from TODAY (UTC).
+    - Only counts completed games ("post").
+    - Returns newest -> oldest, but capped at N.
+    """
+    today = dt.datetime.utcnow().date()
+    team_id_str = str(team_id)
+
+    games: List[Dict[str, Any]] = []
+
+    for delta in range(max_days_back):
+        if len(games) >= n:
             break
 
-        date_str = dt.strftime("%Y%m%d")
-        games = await _get_games_for_date(sport, date_str, d1_only=True)
+        day = today - dt.timedelta(days=delta)
+        date_str = day.strftime("%Y%m%d")
 
-        if not games:
-            zero_days += 1
-            logger.info("FORM %s %s %s -> 0 events", sport, team_id, date_str)
-            if zero_days >= 15:
-                logger.info(
-                    "%s no games for team %s after %d days — stopping early.",
-                    sport.upper(),
-                    team_id,
-                    zero_days,
-                )
-                break
+        events = await _fetch_scoreboard_events(sport, date_str)
+        if not events:
             continue
 
-        zero_days = 0  # reset after a day that has games
-
-        # Filter games for this team & that are final
-        for g in games:
-            home_id = str(g.get("homeId"))
-            away_id = str(g.get("awayId"))
-            if str(team_id) not in (home_id, away_id):
-                continue
-
-            # Only use completed / final games
-            status = (g.get("status") or "").lower()
-            if status not in ("final", "completed", "post"):
-                continue
-
-            results.append(g)
-            if len(results) >= n:
+        for ev in events:
+            if len(games) >= n:
                 break
+            view = _extract_team_view_from_event(sport, team_id_str, ev)
+            if view is None:
+                continue
+            games.append(view)
 
-        if len(results) >= n:
-            break
+    # Newest first (we're already going newest -> oldest by date, but sort just in case)
+    games.sort(key=lambda g: g.get("date") or "", reverse=True)
 
-    logger.info("FORM %s %s -> %d games found", sport, team_id, len(results))
-    return results
+    if len(games) > n:
+        games = games[:n]
+
+    logger.info("FORM %s team=%s -> %d games found", sport, team_id, len(games))
+    return games
 
 
-# -------------------------------------------------
-# Public helpers for routers
-# -------------------------------------------------
-async def get_form_summary(sport: str, team_id: str, n: int = 5):
+# -----------------------------
+# PUBLIC API FOR ROUTERS
+# -----------------------------
+
+async def get_form_summary(
+    sport: str,
+    team_id: str | int,
+    n: int = 5,
+) -> Dict[str, Any]:
     """
-    Return a summary of recent form for one team:
-    - nRequested / nFound
-    - avgFull_scored / avgFull_allowed
-    - avg1H_scored / avg1H_allowed (when available in the ESPN payload)
+    Returns last N games for a given team in a given sport.
+
+    Shape:
+    {
+      "sport": "cbb",
+      "teamId": "150",
+      "nRequested": 5,
+      "nFound": 2,
+      "games": [ ... ]   # newest -> oldest
+    }
     """
-    games = await _get_last_n_games_for_team(sport, team_id, n)
-    if not games:
+    sport = sport.lower()
+    if sport not in SPORT_CONFIG:
         return {
             "sport": sport,
-            "teamId": team_id,
+            "teamId": str(team_id),
             "nRequested": n,
             "nFound": 0,
+            "games": [],
+            "note": "unsupported sport",
         }
 
-    scored_full = []
-    allowed_full = []
-    scored_1h = []
-    allowed_1h = []
-
-    for g in games:
-        home_id = str(g.get("homeId"))
-        away_id = str(g.get("awayId"))
-
-        # ESPN-normalized scores (your event extraction should already set these)
-        home_full = g.get("homeScore")
-        away_full = g.get("awayScore")
-        home_1h = g.get("homeScore1H")
-        away_1h = g.get("awayScore1H")
-
-        if str(team_id) == home_id:
-            scored_full.append(home_full)
-            allowed_full.append(away_full)
-            scored_1h.append(home_1h)
-            allowed_1h.append(away_1h)
-        elif str(team_id) == away_id:
-            scored_full.append(away_full)
-            allowed_full.append(home_full)
-            scored_1h.append(away_1h)
-            allowed_1h.append(home_1h)
-
-    def avg(arr):
-        arr = [a for a in arr if isinstance(a, (int, float))]
-        return round(sum(arr) / len(arr), 1) if arr else None
-
+    games = await _get_last_n_games_for_team_generic(sport, str(team_id), n=n)
     return {
         "sport": sport,
-        "teamId": team_id,
+        "teamId": str(team_id),
         "nRequested": n,
         "nFound": len(games),
-        "avgFull_scored": avg(scored_full),
-        "avgFull_allowed": avg(allowed_full),
-        "avg1H_scored": avg(scored_1h),
-        "avg1H_allowed": avg(allowed_1h),
+        "games": games,
     }
 
 
-async def get_matchup_form(sport: str, team1_id: str, team2_id: str, n: int = 5):
+async def get_matchup_form(
+    sport: str,
+    team1_id: str | int,
+    team2_id: str | int,
+    n: int = 5,
+) -> Dict[str, Any]:
     """
-    Side-by-side form summary for both teams in a matchup.
+    Returns last N games for both teams in a matchup.
+
+    Shape:
+    {
+      "sport": "cbb",
+      "nRecent": 5,
+      "team1": { ... get_form_summary(...) ... },
+      "team2": { ... get_form_summary(...) ... }
+    }
     """
-    team1 = await get_form_summary(sport, team1_id, n)
-    team2 = await get_form_summary(sport, team2_id, n)
+    sport = sport.lower()
+    t1 = await get_form_summary(sport, team1_id, n)
+    t2 = await get_form_summary(sport, team2_id, n)
+
     return {
         "sport": sport,
-        "nRequested": n,
-        "team1": team1,
-        "team2": team2,
+        "nRecent": n,
+        "team1": t1,
+        "team2": t2,
     }
