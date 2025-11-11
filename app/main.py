@@ -1,5 +1,7 @@
 # app/main.py
-from fastapi import FastAPI
+from __future__ import annotations
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -7,11 +9,16 @@ import logging
 import time
 import os
 
-# Routers
-from app.routers import cbb_routes, nfl_routes
-from app.routers import nfl_props_routes
-from app.routers import nfl_debug_routes
-from app.routers import cbb_routes, nfl_routes, nfl_props_routes, nhl_routes, cfb_routes
+# ------------ Router imports ------------
+from app.routers import (
+    cbb_routes,
+    nfl_routes,
+    nfl_props_routes,
+    nfl_debug_routes,
+    nhl_routes,
+    cfb_routes,
+)
+import app.routers.form_routes as form_routes  # generic last-5 / form endpoints
 
 # ------------ Logging ------------
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +33,8 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
-# Access log (method, path, query, status, timing)
+
+# ------------ Access log middleware ------------
 class AccessLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         t0 = time.perf_counter()
@@ -40,13 +48,18 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
             dt = (time.perf_counter() - t0) * 1000
             logger.info(
                 "ACCESS %s %s q=%s -> %s in %.1fms",
-                request.method, request.url.path, request.url.query, status, dt
+                request.method,
+                request.url.path,
+                request.url.query,
+                status,
+                dt,
             )
         return response
 
+
 app.add_middleware(AccessLogMiddleware)
 
-# CORS (open; lock down later if you want)
+# ------------ CORS (open; can tighten later) ------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -55,16 +68,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global error handler
+
+# ------------ Global error handler ------------
 @app.exception_handler(Exception)
-async def _unhandled(request, exc):
+async def _unhandled(request: Request, exc: Exception):
     logger.exception("UNHANDLED ERROR: %s %s", request.method, request.url)
     return JSONResponse(status_code=500, content={"error": "internal_error"})
 
-# Health & status
+
+# ------------ Health & status ------------
 @app.get("/health")
 async def health():
     return {"ok": True}
+
 
 @app.get("/status")
 async def status():
@@ -75,12 +91,18 @@ async def status():
         "books": os.getenv("ODDS_BOOKMAKERS") or None,
     }
 
-# Mount routers
+
+# ------------ Mount routers ------------
+# Sport endpoints
 app.include_router(cbb_routes.router, prefix="/api/cbb")
 app.include_router(nfl_routes.router, prefix="/api/nfl")
 app.include_router(nfl_props_routes.router, prefix="/api/nfl")
 app.include_router(nfl_debug_routes.router, prefix="/api/nfl")
 app.include_router(nhl_routes.router, prefix="/api/nhl")
 app.include_router(cfb_routes.router, prefix="/api/cfb")
+
+# Generic form / last5 endpoints (all sports: cbb, nfl, cfb, nhl)
+app.include_router(form_routes.router, prefix="/api")
+
 
 

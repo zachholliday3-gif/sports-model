@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
-from typing import Optional
 import logging
 
 from app.services.last5_form import get_last5_for_team
@@ -40,7 +39,13 @@ async def form_last5_team(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.exception("form_last5_team failed: sport=%s teamId=%s n=%s err=%s", sport, teamId, n, e)
+        logger.exception(
+            "form_last5_team failed: sport=%s teamId=%s n=%s err=%s",
+            sport,
+            teamId,
+            n,
+            e,
+        )
         raise HTTPException(status_code=500, detail="internal_error")
 
     return data
