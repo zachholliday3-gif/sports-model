@@ -118,26 +118,34 @@ def _team_name(comp: Dict[str, Any]) -> str:
     return team.get("displayName") or team.get("location") or team.get("name") or "Unknown"
 
 
-def extract_game_lite(ev: Dict[str, Any]) -> Dict[str, Any]:
+# app/services/espn_nfl.py
+
+def extract_game_lite(ev: dict) -> dict:
     """
-    Normalize an ESPN event -> lite row used by routers.
+    Flatten an ESPN NFL event into a lite row with team IDs.
     """
-    game_id = ev.get("id") or ""
-    date = ev.get("date")  # ISO timestamp
-    comps = (ev.get("competitions") or [{}])
-    comp = comps[0] if comps else {}
+    comp = (ev.get("competitions") or [{}])[0]
     competitors = comp.get("competitors") or []
 
-    home_name, away_name = "Home", "Away"
-    for c in competitors:
-        if (c.get("homeAway") or "").lower() == "home":
-            home_name = _team_name(c)
-        elif (c.get("homeAway") or "").lower() == "away":
-            away_name = _team_name(c)
+    home = next(
+        (c for c in competitors if c.get("homeAway") == "home"),
+        competitors[0] if competitors else {},
+    )
+    away = next(
+        (c for c in competitors if c.get("homeAway") == "away"),
+        competitors[1] if len(competitors) > 1 else {},
+    )
+
+    home_team = home.get("team") or {}
+    away_team = away.get("team") or {}
 
     return {
-        "gameId": str(game_id),
-        "startTime": date,
-        "homeTeam": home_name,
-        "awayTeam": away_name,
+        "gameId": ev.get("id"),
+        "homeTeam": home_team.get("displayName"),
+        "homeTeamId": home_team.get("id"),
+        "awayTeam": away_team.get("displayName"),
+        "awayTeamId": away_team.get("id"),
+        "startTime": ev.get("date"),
+        "league": (ev.get("league") or {}).get("name"),
     }
+

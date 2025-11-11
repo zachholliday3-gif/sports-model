@@ -96,24 +96,38 @@ async def _fetch_site(date_yyyymmdd: str, d1_only: bool) -> Dict[str, Any]:
         raise
 
 
-def extract_game_lite(event: Dict[str, Any]) -> Dict[str, Any]:
-    comp = (event.get("competitions") or [{}])[0]
-    comps = comp.get("competitors") or []
-    home_name = away_name = None
-    for c in comps:
-        side = (c.get("homeAway") or "").lower()
-        t = c.get("team") or {}
-        nm = t.get("displayName") or t.get("name")
-        if side == "home":
-            home_name = nm
-        elif side == "away":
-            away_name = nm
+# app/services/espn_cbb.py
+
+def extract_game_lite(ev: dict) -> dict:
+    """
+    Flatten an ESPN CBB event into a lite row for the API.
+    Now includes ESPN team IDs for use by /api/form/matchup and GPT.
+    """
+    comp = (ev.get("competitions") or [{}])[0]
+    competitors = comp.get("competitors") or []
+
+    home = next(
+        (c for c in competitors if c.get("homeAway") == "home"),
+        competitors[0] if competitors else {},
+    )
+    away = next(
+        (c for c in competitors if c.get("homeAway") == "away"),
+        competitors[1] if len(competitors) > 1 else {},
+    )
+
+    home_team = home.get("team") or {}
+    away_team = away.get("team") or {}
+
     return {
-        "gameId": event.get("id"),
-        "homeTeam": home_name,
-        "awayTeam": away_name,
-        "startTime": comp.get("date"),
+        "gameId": ev.get("id"),
+        "homeTeam": home_team.get("displayName"),
+        "homeTeamId": home_team.get("id"),
+        "awayTeam": away_team.get("displayName"),
+        "awayTeamId": away_team.get("id"),
+        "startTime": ev.get("date"),
+        "league": (ev.get("league") or {}).get("name"),
     }
+
 
 
 def extract_matchup_detail(event: Dict[str, Any]) -> Dict[str, Any]:

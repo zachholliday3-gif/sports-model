@@ -89,22 +89,37 @@ def _site_params(date_yyyymmdd: str, fbs_only: bool) -> Dict[str, Any]:
     return params
 
 
-def _extract_game_lite(ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    comps = (ev.get("competitions") or [{}])[0]
-    teams = comps.get("competitors") or []
-    if len(teams) < 2:
-        return None
+# app/services/espn_cfb.py
 
-    home = next((c for c in teams if c.get("homeAway") == "home"), teams[0])
-    away = next((c for c in teams if c.get("homeAway") == "away"), teams[-1])
+def extract_game_lite(ev: dict) -> dict:
+    """
+    Flatten an ESPN CFB event into a lite row with team IDs.
+    """
+    comp = (ev.get("competitions") or [{}])[0]
+    competitors = comp.get("competitors") or []
+
+    home = next(
+        (c for c in competitors if c.get("homeAway") == "home"),
+        competitors[0] if competitors else {},
+    )
+    away = next(
+        (c for c in competitors if c.get("homeAway") == "away"),
+        competitors[1] if len(competitors) > 1 else {},
+    )
+
+    home_team = home.get("team") or {}
+    away_team = away.get("team") or {}
 
     return {
         "gameId": ev.get("id"),
-        "homeTeam": (home.get("team") or {}).get("displayName"),
-        "awayTeam": (away.get("team") or {}).get("displayName"),
-        "status": (comps.get("status") or {}).get("type", {}).get("description"),
-        "startTime": comps.get("date"),
+        "homeTeam": home_team.get("displayName"),
+        "homeTeamId": home_team.get("id"),
+        "awayTeam": away_team.get("displayName"),
+        "awayTeamId": away_team.get("id"),
+        "startTime": ev.get("date"),
+        "league": (ev.get("league") or {}).get("name"),
     }
+
 
 
 # ---------- Public API ----------
