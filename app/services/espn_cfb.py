@@ -1,5 +1,3 @@
-from app.services.espn_common import extract_game_lite as _extract_game_lite
-
 # app/services/espn_cfb.py
 from __future__ import annotations
 
@@ -9,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 import re
 from typing import Any, Dict, List, Optional
 import random
+
+from app.services.espn_common import extract_game_lite as _extract_game_lite
 
 logger = logging.getLogger("app.espn_cfb")
 
