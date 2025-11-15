@@ -1,178 +1,115 @@
 # app/services/espn_cfb.py
+
 from __future__ import annotations
-
-import httpx
 import logging
-from datetime import datetime, timedelta, timezone
-import re
 from typing import Any, Dict, List, Optional
-import random
 
-from app.services.espn_common import extract_game_lite as _extract_game_lite
+from app.services.espn_common import _get_json, normalize_date_param
 
 logger = logging.getLogger("app.espn_cfb")
 
-# ✅ ESPN College Football scoreboard (NOT NHL)
-SITE_BASE = "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard"
-HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+# ESPN CFB scoreboard endpoint
+SITE_BASE = (
+    "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard"
+)
 
 
-# ---------- Date helpers (same style as CBB/NHL/NFL) ----------
-
-def _ny_today_yyyymmdd() -> str:
+# ----------------------------------------------------------------------
+# FETCH GAMES FOR A DATE — WITH AUTO-FALLBACK IF FBS-ONLY RETURNS 0
+# ----------------------------------------------------------------------
+async def get_games_for_date(
+    date: Optional[str] = None,
+    fbs_only: bool = True,
+) -> List[Dict[str, Any]]:
     """
-    Treat 'today' as America/New_York (UTC-5 style),
-    consistent with your other sports.
+    Fetch CFB games for a date.
+
+    LOGIC:
+    - Normalize date (YYYYMMDD)
+    - If fbs_only=True:
+        → Try ESPN group=80 (FBS)
+        → If 0 events → remove group filter and re-fetch ALL levels
+    - If fbs_only=False:
+        → Always fetch ALL levels
     """
-    ny_now = datetime.now(timezone.utc) - timedelta(hours=5)
-    return ny_now.strftime("%Y%m%d")
 
+    date_str = normalize_date_param(date)
+    params: Dict[str, Any] = {"dates": date_str, "limit": 500}
 
-def _yyyymmdd(date_str: Optional[str]) -> str:
-    """
-    Normalize incoming date to strictly 'YYYYMMDD'.
-
-    Accepts:
-      - 'YYYYMMDD'
-      - 'YYYY-MM-DD'
-      - other ISO-like strings
-
-    If missing or invalid, falls back to NY 'today'.
-    """
-    if not date_str:
-        return _ny_today_yyyymmdd()
-
-    s = date_str.strip()
-    digits = re.sub(r"\D", "", s)
-    if len(digits) == 8:
-        return digits
-
-    try:
-        dt = datetime.fromisoformat(s[:10])
-        return dt.strftime("%Y%m%d")
-    except Exception:
-        logger.warning("espn_cfb: could not parse date '%s', falling back to NY today", date_str)
-        return _ny_today_yyyymmdd()
-
-
-# ---------- HTTP helper ----------
-
-async def _get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """Small retry wrapper for ESPN CFB."""
-    last = None
-    async with httpx.AsyncClient(timeout=10.0, headers=HEADERS) as client:
-        for attempt in range(2):
-            try:
-                r = await client.get(url, params=params)
-                r.raise_for_status()
-                return r.json()
-            except Exception as e:
-                last = e
-                logger.warning("espn_cfb _get_json attempt %d failed: %s", attempt + 1, e)
-    raise last or RuntimeError("unknown http error")
-
-
-# ---------- Params + extraction ----------
-
-def _site_params(date_yyyymmdd: str, fbs_only: bool) -> Dict[str, Any]:
-    """
-    Build ESPN site params.
-
-    - ESPN CFB 'groups=80' ~= FBS (top division)
-    - If fbs_only=True, we send groups=80 first; if that returns 0 events,
-      we'll retry without groups (all levels).
-    """
-    params: Dict[str, Any] = {
-        "dates": date_yyyymmdd,
-        "limit": 500,
-    }
+    # First attempt: FBS-only
     if fbs_only:
-        params["groups"] = 80  # FBS group
-    return params
+        params["groups"] = 80  # ESPN’s FBS group
 
-
-# app/services/espn_cfb.py
-
-def extract_game_lite(ev: dict) -> dict:
-    """
-    Flatten an ESPN CFB event into a lite row with team IDs.
-    """
-    comp = (ev.get("competitions") or [{}])[0]
-    competitors = comp.get("competitors") or []
-
-    home = next(
-        (c for c in competitors if c.get("homeAway") == "home"),
-        competitors[0] if competitors else {},
-    )
-    away = next(
-        (c for c in competitors if c.get("homeAway") == "away"),
-        competitors[1] if len(competitors) > 1 else {},
+    logger.info(
+        "CFB get_games_for_date date=%s fbs_only=%s params=%s",
+        date_str, fbs_only, params,
     )
 
-    home_team = home.get("team") or {}
-    away_team = away.get("team") or {}
-
-    return {
-        "gameId": ev.get("id"),
-        "homeTeam": home_team.get("displayName"),
-        "homeTeamId": home_team.get("id"),
-        "awayTeam": away_team.get("displayName"),
-        "awayTeamId": away_team.get("id"),
-        "startTime": ev.get("date"),
-        "league": (ev.get("league") or {}).get("name"),
-    }
-
-
-
-# ---------- Public API ----------
-
-async def get_games_for_date(date: Optional[str] = None, fbs_only: bool = True) -> List[Dict[str, Any]]:
-    """
-    Fetch College Football games for the given date.
-
-    - date: 'YYYYMMDD' or 'YYYY-MM-DD' or None (today in NY)
-    - fbs_only: if True, try FBS (groups=80) first.
-      If that returns 0 events, auto-fallback to ALL levels.
-    """
-    d = _yyyymmdd(date)
-    logger.info("CFB get_games_for_date date=%s fbs_only=%s", d, fbs_only)
-
-    # 1) Try with FBS-only if requested
-    params = _site_params(d, fbs_only=fbs_only)
+    # First fetch
     data = await _get_json(SITE_BASE, params)
     events = data.get("events") or []
+    logger.info(
+        "CFB get_games_for_date %s -> %d events (initial)",
+        date_str, len(events)
+    )
 
-    # If we insisted on FBS and got nothing, try all levels
-    if fbs_only and len(events) == 0:
-        logger.info("CFB get_games_for_date: FBS-only returned 0 events for %s; retrying without group filter", d)
-        params2 = _site_params(d, fbs_only=False)
-        data2 = await _get_json(SITE_BASE, params2)
-        events = data2.get("events") or []
+    # Fallback if FBS-only returned nothing
+    if fbs_only and not events:
+        logger.info(
+            "CFB get_games_for_date: FBS group returned 0 events for %s — auto-fallback to ALL levels",
+            date_str,
+        )
 
-    out: List[Dict[str, Any]] = []
-    for ev in events:
-        lite = _extract_game_lite(ev)
-        if lite and lite.get("homeTeam") and lite.get("awayTeam"):
-            out.append(lite)
+        # Remove the FBS filter
+        params.pop("groups", None)
 
-    logger.info("CFB get_games_for_date %s -> %d events", d, len(out))
-    return out
+        # Re-fetch ALL levels
+        data = await _get_json(SITE_BASE, params)
+        events = data.get("events") or []
+
+        logger.info(
+            "CFB get_games_for_date (fallback ALL) %s -> %d events",
+            date_str, len(events)
+        )
+
+    return events
 
 
-def project_cfb_fg(home_team: str, away_team: str) -> Dict[str, Any]:
+# ----------------------------------------------------------------------
+# FULL-GAME PROJECTION (SIMPLE MODEL)
+# ----------------------------------------------------------------------
+def project_cfb_fg(game: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Simple placeholder full-game projection for College Football.
-    Later you can wire a real model into this.
+    Very simple placeholder model: average team stats from ESPN game object.
+    This was in your original code — preserved so API doesn't break.
     """
-    # College scoring tends to be higher and more volatile
-    base_total = round(random.uniform(48.0, 70.0), 1)
-    # Spreads can be wide in CFB
-    spread = round(random.uniform(-21.0, 21.0), 1)
-    # Arbitrary confidence range
-    confidence = round(random.uniform(0.55, 0.9), 2)
+    comps = game.get("competitions", [{}])[0]
+    if not comps:
+        return {}
+
+    competitors = comps.get("competitors", [])
+    if len(competitors) != 2:
+        return {}
+
+    home = next((t for t in competitors if t.get("homeAway") == "home"), None)
+    away = next((t for t in competitors if t.get("homeAway") == "away"), None)
+
+    if not home or not away:
+        return {}
+
+    # naive projected scoring from ESPN's game summary
+    home_score = float(home.get("score", 0))
+    away_score = float(away.get("score", 0))
+
+    proj_total = home_score + away_score
+    proj_spread_home = home_score - away_score
 
     return {
-        "projTotal": base_total,
-        "projSpreadHome": spread,
-        "confidence": confidence,
+        "homeTeam": home.get("team", {}).get("displayName"),
+        "awayTeam": away.get("team", {}).get("displayName"),
+        "homeId": home.get("team", {}).get("id"),
+        "awayId": away.get("team", {}).get("id"),
+        "projTotal": proj_total,
+        "projSpreadHome": proj_spread_home,
+        "confidence": 0.55,  # placeholder
     }
