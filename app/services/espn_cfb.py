@@ -1,3 +1,5 @@
+from app.services.espn_common import extract_game_lite as _extract_game_lite
+
 # app/services/espn_cfb.py
 from __future__ import annotations
 
